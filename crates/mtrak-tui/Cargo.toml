@@ -1,0 +1,19 @@
+[package]
+name = "mtrak-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Terminal user interface and command layer for mtrak."
+
+[dependencies]
+mtrak-core.workspace = true
+mtrak-engine.workspace = true
+mtrak-midi.workspace = true
+mtrak-midi-io.workspace = true
+thiserror.workspace = true
+ratatui.workspace = true
+
+[lints]
+workspace = true

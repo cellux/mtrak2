@@ -1,0 +1,17 @@
+[package]
+name = "mtrak-midi-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Standard MIDI File import/export and tracker project metadata for mtrak."
+
+[dependencies]
+mtrak-core.workspace = true
+mtrak-engine.workspace = true
+thiserror.workspace = true
+midly = "0.5"
+
+[lints]
+workspace = true

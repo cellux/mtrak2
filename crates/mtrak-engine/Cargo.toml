@@ -1,0 +1,25 @@
+[package]
+name = "mtrak-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic scheduler and sandboxed Lua macro runtime for mtrak."
+
+[dependencies]
+mtrak-core.workspace = true
+thiserror.workspace = true
+
+[dependencies.mlua]
+version = "0.10"
+optional = true
+features = ["lua54", "vendored"]
+
+[features]
+default = []
+# Enables the sandboxed Lua macro runtime (phase P5).
+lua = ["dep:mlua"]
+
+[lints]
+workspace = true

@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mtrak-core",
+    "crates/mtrak-engine",
+    "crates/mtrak-midi-io",
+    "crates/mtrak-midi",
+    "crates/mtrak-tui",
+    "crates/mtrak",
+]
+
+default-members = ["crates/mtrak"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/mtrak"
+description = "A MIDI tracker with a reusable engine, sandboxed Lua macros, and standard MIDI I/O."
+
+[workspace.dependencies]
+mtrak-core = { path = "crates/mtrak-core" }
+mtrak-engine = { path = "crates/mtrak-engine" }
+mtrak-midi-io = { path = "crates/mtrak-midi-io" }
+mtrak-midi = { path = "crates/mtrak-midi" }
+mtrak-tui = { path = "crates/mtrak-tui" }
+
+thiserror = "2"
+ratatui = "0.28"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"

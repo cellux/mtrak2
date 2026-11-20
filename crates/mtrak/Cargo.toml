@@ -1,0 +1,28 @@
+[package]
+name = "mtrak"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The mtrak MIDI tracker application."
+publish = false
+
+[[bin]]
+name = "mtrak"
+path = "src/main.rs"
+
+[features]
+default = ["lua", "midir"]
+lua = ["mtrak-engine/lua"]
+midir = ["mtrak-midi/midir-backend"]
+
+[dependencies]
+mtrak-core.workspace = true
+mtrak-engine.workspace = true
+mtrak-midi-io.workspace = true
+mtrak-midi.workspace = true
+mtrak-tui.workspace = true
+
+[lints]
+workspace = true
