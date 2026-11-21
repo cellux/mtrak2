@@ -173,6 +173,7 @@ fn draw_help(frame: &mut Frame, area: Area) {
         Line::raw(""),
         Line::raw("Pattern: arrows move  hex types  enter edits  alt-enter choose"),
         Line::raw("         o offsets  space play  : command  ctrl-n note  ctrl-s save"),
+        Line::raw("         ctrl-f follow the playhead"),
         Line::raw("Code:    alt-enter choose module  F5 reload  ctrl-z undo"),
     ];
     frame.render_widget(Paragraph::new(text), inner);
@@ -201,7 +202,12 @@ fn draw_pattern(frame: &mut Frame, app: &App, area: Area) {
         .min(tracks);
     let visible_rows = (inner.height as usize).saturating_sub(1).max(1);
     let (cursor_row, cursor_track, cursor_nibble) = app.cursor();
-    let row_off = scroll_offset(cursor_row, rows, visible_rows);
+    let view_row = if app.is_playing() && app.follow_playhead() {
+        app.play_row()
+    } else {
+        cursor_row
+    };
+    let row_off = scroll_offset(view_row, rows, visible_rows);
     let track_off = scroll_offset(cursor_track, tracks, visible_tracks);
     let selection = app.selection_bounds();
     let brush = app.brush_rect();
@@ -750,6 +756,39 @@ mod tests {
         let buffer = terminal.backend().buffer().clone();
         assert_ne!(buffer[cell(0, 15)].bg, CHOOSER_AXIS_BG);
         assert_ne!(buffer[cell(4, 0)].bg, CHOOSER_AXIS_BG);
+    }
+
+    #[test]
+    fn follow_playhead_scrolls_the_view_to_the_playing_row() {
+        use crate::key::Action;
+
+        let mut app = app_with(64, 2);
+        for _ in 0..50 {
+            app.apply(Action::MoveDown);
+        }
+        app.apply(Action::SetStartRow);
+        app.apply(Action::Home);
+        assert_eq!(app.cursor().0, 0);
+        app.handle_key(Key::ctrl(Code::Char('f')));
+        assert!(app.follow_playhead());
+        app.start_playback();
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let marker_visible = |terminal: &mut Terminal<TestBackend>, app: &App| {
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.width)
+                .flat_map(|x| (0..buffer.area.height).map(move |y| (x, y)))
+                .any(|(x, y)| buffer[(x, y)].symbol() == PLAY_ROW_MARK.to_string())
+        };
+
+        assert!(marker_visible(&mut terminal, &app), "playhead is in view");
+        app.handle_key(Key::ctrl(Code::Char('f')));
+        assert!(!app.follow_playhead());
+        assert!(
+            !marker_visible(&mut terminal, &app),
+            "without follow the view stays at the cursor"
+        );
     }
 
     fn cells_with_bg(buffer: &ratatui::buffer::Buffer, bg: Color) -> Vec<(u16, u16)> {

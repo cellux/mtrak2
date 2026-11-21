@@ -65,6 +65,8 @@ pub enum Command {
     PortSelect(usize),
     /// `:event BYTES` — a hex byte sequence for the current cell.
     Event(Vec<u8>),
+    /// `:follow` — toggle scrolling with the playhead.
+    Follow,
     /// `:help`.
     Help,
 }
@@ -118,6 +120,7 @@ pub fn parse(input: &str) -> Result<Command, String> {
         "pattern" | "pat" => parse_pattern(&rest)?,
         "port" | "midi" => parse_port(&rest)?,
         "event" | "ev" => Command::Event(parse_event_bytes(&rest)?),
+        "follow" | "fol" => Command::Follow,
         "help" | "h" | "?" => Command::Help,
         other => return Err(format!("unknown command: {other}")),
     };
@@ -282,6 +285,8 @@ mod tests {
         assert_eq!(parse(":rows 64"), Ok(Command::Rows(64)));
         assert_eq!(parse(":tracks 16"), Ok(Command::Tracks(16)));
         assert_eq!(parse(":root C-4"), Ok(Command::Root("C-4".to_string())));
+        assert_eq!(parse(":follow"), Ok(Command::Follow));
+        assert_eq!(parse(":fol"), Ok(Command::Follow));
     }
 
     #[test]

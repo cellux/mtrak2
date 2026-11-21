@@ -196,6 +196,8 @@ pub enum Action {
     CommandMode,
     /// Toggle note-entry mode.
     ToggleNoteMode,
+    /// Keep the playing row in view.
+    ToggleFollow,
     /// Toggle chromatic note entry.
     ToggleChromatic,
     /// Undo.
@@ -256,6 +258,7 @@ pub fn lookup(key: Key) -> Option<Action> {
         (Char('s'), false, _) => A::SetStartRow,
         (Char(':'), false, _) => A::CommandMode,
         (Char('n'), true, _) => A::ToggleNoteMode,
+        (Char('f'), true, _) => A::ToggleFollow,
         (Char('N'), false, _) => A::ToggleChromatic,
         (Char('z'), true, _) => A::Undo,
         (Char('r'), true, _) => A::Redo,
@@ -310,6 +313,10 @@ mod tests {
         assert_eq!(
             lookup(Key::ctrl(Code::Char('n'))),
             Some(Action::ToggleNoteMode)
+        );
+        assert_eq!(
+            lookup(Key::ctrl(Code::Char('f'))),
+            Some(Action::ToggleFollow)
         );
         assert_eq!(lookup(Key::ch('N')), Some(Action::ToggleChromatic));
         assert_eq!(lookup(Key::ctrl(Code::Char('z'))), Some(Action::Undo));

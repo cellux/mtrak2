@@ -280,6 +280,7 @@ pub struct App {
     edit_recorded: bool,
     clipboard: NibbleClipboard,
     offsets_visible: bool,
+    follow_playhead: bool,
     pattern_undo: HashMap<PatternId, UndoStack<Pattern>>,
     pattern_struct_undo: UndoStack<Composition>,
 
@@ -342,6 +343,7 @@ impl App {
             edit_recorded: false,
             clipboard: NibbleClipboard::default(),
             offsets_visible: false,
+            follow_playhead: false,
             pattern_undo: HashMap::new(),
             pattern_struct_undo: UndoStack::new(64),
             module_id,
@@ -498,6 +500,16 @@ impl App {
     /// Whether offsets are visible.
     pub fn offsets_visible(&self) -> bool {
         self.offsets_visible
+    }
+
+    /// Whether the pattern view scrolls with the playing row.
+    pub fn follow_playhead(&self) -> bool {
+        self.follow_playhead
+    }
+
+    /// Toggles whether the pattern view follows the playhead.
+    pub fn toggle_follow(&mut self) {
+        self.follow_playhead = !self.follow_playhead;
     }
 
     /// The grid cursor as `(row, track, nibble)`.
@@ -828,6 +840,7 @@ impl App {
             Action::Copy => self.copy(),
             Action::Paste => self.paste(),
             Action::ToggleOffsets => self.toggle_offsets(),
+            Action::ToggleFollow => self.toggle_follow(),
             Action::TogglePlay => self.toggle_playback(),
             Action::SetStartRow => self.play_start_row = self.row,
             Action::CommandMode => self.enter_command_mode(),
@@ -1630,6 +1643,10 @@ impl App {
             Command::Write(path) => return self.save(path),
             Command::Export(path) => return self.export(path),
             Command::Event(bytes) => return self.commit_event_bytes(&bytes),
+            Command::Follow => {
+                self.toggle_follow();
+                return Ok(());
+            }
             Command::Bpm(value) => {
                 let bpm = Bpm::from_int(value).ok_or_else(|| format!("invalid bpm: {value}"))?;
                 self.project.composition.set_bpm(bpm);
@@ -1735,7 +1752,7 @@ impl App {
             }
             Command::Help => {
                 self.set_message(
-                    "read write export bpm tpb lpb root scale mode rows tracks pattern port event"
+                    "read write export bpm tpb lpb root scale mode rows tracks pattern port event follow"
                         .to_string(),
                     false,
                 );
@@ -2942,6 +2959,19 @@ mod tests {
         assert_eq!(app.screen(), Screen::Help);
         app.handle_key(Key::new(Code::Function(2)));
         assert_eq!(app.screen(), Screen::Pattern);
+    }
+
+    #[test]
+    fn follow_toggles_with_ctrl_f_and_the_command() {
+        let mut app = app_with(8, 2);
+        assert!(!app.follow_playhead());
+        app.handle_key(Key::ctrl(Code::Char('f')));
+        assert!(app.follow_playhead());
+        app.handle_key(Key::ch(':'));
+        type_hex(&mut app, "follow");
+        app.handle_key(Key::new(Code::Enter));
+        assert!(!app.follow_playhead());
+        assert!(!app.is_dirty(), "following is only a view option");
     }
 
     #[test]
