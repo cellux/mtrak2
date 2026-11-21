@@ -56,6 +56,27 @@ pub struct Message {
     pub is_error: bool,
 }
 
+/// How many candidates PgUp/PgDn move the completion highlight.
+const COMPLETION_PAGE: isize = 10;
+
+/// The open Tab-completion list of a path argument on the command line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PathCompletion {
+    /// Character index where the path argument starts.
+    start: usize,
+    /// Character index one past the path argument.
+    end: usize,
+    /// Directory part of the path when the menu opened, including its `/`.
+    /// The menu closes once the typed path no longer starts with it.
+    dir_prefix: String,
+    /// Every candidate for that directory, sorted.
+    all: Vec<String>,
+    /// Indices into `all` that match the typed path.
+    matches: Vec<usize>,
+    /// Highlighted index into `matches`.
+    selected: usize,
+}
+
 /// A project command registered by the Lua setup module. It is TUI-only and is
 /// never serialized into an exported file.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -267,6 +288,7 @@ pub struct App {
     message: Option<Message>,
     input: LineEditor,
     command_failed: bool,
+    path_completion: Option<PathCompletion>,
 
     // Pattern workspace.
     current: PatternId,
@@ -335,6 +357,7 @@ impl App {
             message: None,
             input: LineEditor::new(),
             command_failed: false,
+            path_completion: None,
             current,
             row: 0,
             track: 0,
@@ -404,6 +427,18 @@ impl App {
     /// The command cursor position.
     pub fn input_cursor(&self) -> usize {
         self.input.cursor()
+    }
+
+    /// The open path-completion menu as `(all candidates, matching indices,
+    /// highlighted match)`.
+    pub fn path_completions(&self) -> Option<(&[String], &[usize], usize)> {
+        self.path_completion.as_ref().map(|completion| {
+            (
+                completion.all.as_slice(),
+                completion.matches.as_slice(),
+                completion.selected,
+            )
+        })
     }
 
     /// Whether the current command is in the failed (red) state.
@@ -1723,6 +1758,7 @@ impl App {
         };
         self.mode = Mode::Command;
         self.command_failed = false;
+        self.path_completion = None;
         self.input.clear();
     }
 
@@ -1749,6 +1785,7 @@ impl App {
         self.previous_mode = self.mode;
         self.mode = Mode::Command;
         self.command_failed = false;
+        self.path_completion = None;
         self.input = LineEditor::from_text(&text);
         // Place the cursor on the first event nibble (after "event ").
         self.input.set_cursor("event ".len());
@@ -1952,6 +1989,56 @@ impl App {
         }
         self.dirty = true;
         Ok(())
+    }
+
+    /// Completes the path under the cursor, opening its menu when ambiguous.
+    fn complete_input(&mut self) {
+        let text = self.input.text();
+        let cursor = self.input.cursor();
+        let Some(found) = crate::complete::path_candidates(&text, cursor) else {
+            return;
+        };
+        match found.values.len() {
+            0 => {}
+            1 => {
+                self.replace_input_range(found.start, found.end, &found.values[0]);
+            }
+            _ => {
+                let shared = crate::complete::shared_prefix(&found.values);
+                let end = if shared.chars().count() > found.fragment.chars().count() {
+                    self.replace_input_range(found.start, found.end, &shared)
+                } else {
+                    found.end
+                };
+                let dir_prefix = match found.fragment.rfind('/') {
+                    Some(index) => found.fragment[..=index].to_string(),
+                    None => String::new(),
+                };
+                self.path_completion = Some(PathCompletion {
+                    start: found.start,
+                    end,
+                    dir_prefix,
+                    matches: (0..found.values.len()).collect(),
+                    all: found.values,
+                    selected: 0,
+                });
+            }
+        }
+    }
+
+    /// Replaces characters `start..end` of the command line, returning the new
+    /// cursor position.
+    fn replace_input_range(&mut self, start: usize, end: usize, value: &str) -> usize {
+        let chars: Vec<char> = self.input.text().chars().collect();
+        let start = start.min(chars.len());
+        let end = end.min(chars.len()).max(start);
+        let mut out: Vec<char> = chars[..start].to_vec();
+        out.extend(value.chars());
+        out.extend(chars[end..].iter());
+        let cursor = start + value.chars().count();
+        self.input = LineEditor::from_text(&out.into_iter().collect::<String>());
+        self.input.set_cursor(cursor);
+        cursor
     }
 
     fn execute_command_line(&mut self) {
@@ -2326,7 +2413,7 @@ impl App {
 
     fn resolve_path(&self, given: Option<String>) -> Result<PathBuf, String> {
         match given {
-            Some(path) => Ok(PathBuf::from(path)),
+            Some(path) => Ok(crate::path::expand_tilde(&path)),
             None => self
                 .path
                 .clone()
@@ -2569,22 +2656,176 @@ impl App {
     }
 
     fn handle_command_key(&mut self, key: Key) {
+        if self.path_completion.is_some() && self.handle_completion_key(key) {
+            return;
+        }
+        let completes = key.code == Code::Tab && !key.shift && !key.ctrl && !key.alt;
+        if !completes {
+            // Any other key closes the completion menu.
+            self.path_completion = None;
+        }
         match key.code {
-            Code::Esc => {
-                self.input.clear();
-                self.command_failed = false;
-                self.mode = self.previous_mode;
-            }
+            Code::Esc => self.cancel_command(),
             Code::Enter => self.execute_command_line(),
+            Code::Tab if completes => self.complete_input(),
+            // Alt-Backspace (and Alt-Ctrl-H, which some terminals send for it)
+            // deletes the word before the cursor.
+            Code::Backspace if key.alt => self.input.kill_word_backward(),
+            Code::Char('h') if key.ctrl && key.alt => self.input.kill_word_backward(),
             Code::Backspace => self.input.backspace(),
             Code::Delete => self.input.delete(),
+            Code::Left if key.alt => self.input.move_word_left(),
             Code::Left => self.input.move_left(),
+            Code::Right if key.alt => self.input.move_word_right(),
             Code::Right => self.input.move_right(),
             Code::Home => self.input.move_home(),
             Code::End => self.input.move_end(),
+            // Emacs/readline bindings.
+            Code::Char('a') if key.ctrl => self.input.move_home(),
+            Code::Char('e') if key.ctrl => self.input.move_end(),
+            Code::Char('b') if key.ctrl => self.input.move_left(),
+            Code::Char('f') if key.ctrl => self.input.move_right(),
+            Code::Char('d') if key.ctrl => {
+                if self.input.is_empty() {
+                    // End of input, like readline's EOF.
+                    self.cancel_command();
+                } else {
+                    self.input.delete();
+                }
+            }
+            Code::Char('h') if key.ctrl => self.input.backspace(),
+            Code::Char('k') if key.ctrl => self.input.kill_to_end(),
+            Code::Char('u') if key.ctrl => self.input.kill_to_start(),
+            Code::Char('w') if key.ctrl => self.input.kill_whitespace_word_backward(),
+            Code::Char('y') if key.ctrl => self.input.yank(),
+            Code::Char('t') if key.ctrl => self.input.transpose(),
+            Code::Char('g') if key.ctrl => self.cancel_command(),
+            Code::Char('c') if key.ctrl => self.cancel_command(),
+            Code::Char('b') if key.alt => self.input.move_word_left(),
+            Code::Char('f') if key.alt => self.input.move_word_right(),
+            Code::Char('d') if key.alt => self.input.kill_word_forward(),
             Code::Char(c) if !key.ctrl && !key.alt => self.input.insert(c),
             _ => {}
         }
+    }
+
+    /// Handles a key while the completion menu is open, returning whether the
+    /// key was consumed by the menu.
+    fn handle_completion_key(&mut self, key: Key) -> bool {
+        let plain = !key.ctrl && !key.alt && !key.shift;
+        match key.code {
+            Code::Up => self.move_completion(-1),
+            Code::Down => self.move_completion(1),
+            Code::PageUp => self.move_completion(-COMPLETION_PAGE),
+            Code::PageDown => self.move_completion(COMPLETION_PAGE),
+            Code::Home => self.select_completion(0),
+            Code::End => self.select_completion(usize::MAX),
+            // Emacs-style movement inside the menu.
+            Code::Char('p') if key.ctrl => self.move_completion(-1),
+            Code::Char('n') if key.ctrl => self.move_completion(1),
+            Code::Tab | Code::Enter if plain => self.accept_completion(),
+            Code::Esc => self.path_completion = None,
+            // Typing narrows the list instead of closing it.
+            Code::Char(c) if !key.ctrl && !key.alt => {
+                self.input.insert(c);
+                self.refilter_completions();
+            }
+            Code::Backspace if key.alt => {
+                let floor = self.completion_floor();
+                if self.input.cursor() <= floor {
+                    return false;
+                }
+                self.input.kill_word_backward_from(floor);
+                self.refilter_completions();
+            }
+            Code::Backspace if !key.ctrl && !key.shift => {
+                let floor = self.completion_floor();
+                if self.input.cursor() <= floor {
+                    return false;
+                }
+                self.input.backspace();
+                self.refilter_completions();
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// The path argument's start, or 0 when no menu is open.
+    fn completion_floor(&self) -> usize {
+        self.path_completion
+            .as_ref()
+            .map(|completion| completion.start)
+            .unwrap_or(0)
+    }
+
+    /// Re-filters the menu against the typed path, closing it on no matches.
+    fn refilter_completions(&mut self) {
+        let Some(completion) = self.path_completion.as_mut() else {
+            return;
+        };
+        let text: Vec<char> = self.input.text().chars().collect();
+        let cursor = self.input.cursor().min(text.len());
+        let start = completion.start.min(cursor);
+        completion.end = text.len();
+        let fragment: String = text[start..cursor].iter().collect();
+        if !fragment.starts_with(&completion.dir_prefix) {
+            self.path_completion = None;
+            return;
+        }
+        completion.matches = completion
+            .all
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.starts_with(&fragment))
+            .map(|(index, _)| index)
+            .collect();
+        completion.selected = 0;
+        if completion.matches.is_empty() {
+            self.path_completion = None;
+        }
+    }
+
+    /// Moves the completion highlight by `delta`, clamped to the menu.
+    fn move_completion(&mut self, delta: isize) {
+        let Some(completion) = self.path_completion.as_mut() else {
+            return;
+        };
+        let last = completion.matches.len().saturating_sub(1);
+        completion.selected = if delta < 0 {
+            completion.selected.saturating_sub(delta.unsigned_abs())
+        } else {
+            completion.selected.saturating_add(delta as usize).min(last)
+        };
+    }
+
+    /// Highlights one candidate, clamped to the menu.
+    fn select_completion(&mut self, index: usize) {
+        if let Some(completion) = self.path_completion.as_mut() {
+            completion.selected = index.min(completion.matches.len().saturating_sub(1));
+        }
+    }
+
+    /// Inserts the highlighted candidate and closes the menu.
+    fn accept_completion(&mut self) {
+        let Some(completion) = self.path_completion.take() else {
+            return;
+        };
+        let Some(index) = completion.matches.get(completion.selected) else {
+            return;
+        };
+        let Some(value) = completion.all.get(*index).cloned() else {
+            return;
+        };
+        self.replace_input_range(completion.start, completion.end, &value);
+    }
+
+    /// Abandons the command line and returns to the previous mode.
+    fn cancel_command(&mut self) {
+        self.input.clear();
+        self.path_completion = None;
+        self.command_failed = false;
+        self.mode = self.previous_mode;
     }
 
     fn handle_chooser_key(&mut self, key: Key) {
@@ -3119,6 +3360,223 @@ mod tests {
     }
 
     #[test]
+    fn tab_completes_paths_in_read_and_write_commands() {
+        let dir = std::env::temp_dir().join(format!("mtrak-app-complete-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("unique.mid"), b"").unwrap();
+        std::fs::write(dir.join("with space.mid"), b"").unwrap();
+        let dir = dir.to_string_lossy().into_owned();
+
+        let mut app = app_with(4, 1);
+        app.handle_key(Key::ch(':'));
+        type_hex(&mut app, &format!("r {dir}/uni"));
+        app.handle_key(Key::new(Code::Tab));
+        assert_eq!(app.input_text(), format!("r {dir}/unique.mid"));
+        assert_eq!(app.input_cursor(), app.input_text().chars().count());
+        assert_eq!(app.mode(), Mode::Command, "Tab keeps command mode open");
+
+        // File names with spaces are completed as one argument.
+        app.handle_key(Key::new(Code::Esc));
+        app.handle_key(Key::ch(':'));
+        type_hex(&mut app, &format!("w {dir}/with"));
+        app.handle_key(Key::new(Code::Tab));
+        assert_eq!(app.input_text(), format!("w {dir}/with space.mid"));
+
+        // Other commands and a Tab on the command name do nothing.
+        app.handle_key(Key::new(Code::Esc));
+        app.handle_key(Key::ch(':'));
+        type_hex(&mut app, "bpm 12");
+        app.handle_key(Key::new(Code::Tab));
+        assert_eq!(app.input_text(), "bpm 12");
+    }
+
+    #[test]
+    fn command_line_emacs_shortcuts() {
+        let mut app = app_with(4, 1);
+        app.handle_key(Key::ch(':'));
+        type_hex(&mut app, "r /tmp/song.mid");
+
+        // Alt-Backspace deletes the word before the cursor...
+        app.handle_key(Key::alt(Code::Backspace));
+        assert_eq!(app.input_text(), "r /tmp/song.");
+        // ...and Ctrl-Y puts it back.
+        app.handle_key(Key::ctrl(Code::Char('y')));
+        assert_eq!(app.input_text(), "r /tmp/song.mid");
+
+        // Ctrl-A/Ctrl-K/Ctrl-Y: home, kill the line, yank it back.
+        app.handle_key(Key::ctrl(Code::Char('a')));
+        assert_eq!(app.input_cursor(), 0);
+        app.handle_key(Key::ctrl(Code::Char('k')));
+        assert_eq!(app.input_text(), "");
+        app.handle_key(Key::ctrl(Code::Char('y')));
+        assert_eq!(app.input_text(), "r /tmp/song.mid");
+
+        // Ctrl-E goes to the end, Ctrl-W kills the whole argument.
+        app.handle_key(Key::ctrl(Code::Char('e')));
+        assert_eq!(app.input_cursor(), app.input_text().chars().count());
+        app.handle_key(Key::ctrl(Code::Char('w')));
+        assert_eq!(app.input_text(), "r ");
+        assert_eq!(app.input_cursor(), 2);
+
+        // Ctrl-C abandons the command.
+        app.handle_key(Key::ctrl(Code::Char('c')));
+        assert_eq!(app.mode(), Mode::Normal);
+        assert!(app.input_text().is_empty());
+    }
+
+    #[test]
+    fn ctrl_d_on_an_empty_command_line_closes_it() {
+        let mut app = app_with(4, 1);
+        app.handle_key(Key::ch(':'));
+        assert_eq!(app.mode(), Mode::Command);
+        app.handle_key(Key::ctrl(Code::Char('d')));
+        assert_eq!(app.mode(), Mode::Normal);
+
+        // With text, Ctrl-D deletes the character at the cursor instead.
+        app.handle_key(Key::ch(':'));
+        type_hex(&mut app, "abc");
+        app.handle_key(Key::ctrl(Code::Char('a')));
+        app.handle_key(Key::ctrl(Code::Char('d')));
+        assert_eq!(app.input_text(), "bc");
+        assert_eq!(app.mode(), Mode::Command);
+    }
+
+    #[test]
+    fn completion_menu_navigates_and_accepts_with_tab_or_enter() {
+        let dir =
+            std::env::temp_dir().join(format!("mtrak-app-complete-list-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["aa.mid", "bb.mid", "cc.mid"] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let dir = dir.to_string_lossy().into_owned();
+        let expected = vec![
+            format!("{dir}/aa.mid"),
+            format!("{dir}/bb.mid"),
+            format!("{dir}/cc.mid"),
+            format!("{dir}/sub/"),
+        ];
+
+        let mut app = app_with(4, 1);
+        let open_menu = |app: &mut App| {
+            app.handle_key(Key::new(Code::Esc));
+            app.handle_key(Key::ch(':'));
+            type_hex(app, &format!("r {dir}/"));
+            app.handle_key(Key::new(Code::Tab));
+            assert_eq!(app.input_text(), format!("r {dir}/"));
+            let (values, matches, selected) = app.path_completions().unwrap();
+            assert_eq!(values.to_vec(), expected);
+            assert_eq!(matches.len(), 4);
+            assert_eq!(selected, 0);
+            assert_eq!(app.mode(), Mode::Command);
+        };
+        let selected = |app: &App| app.path_completions().unwrap().2;
+
+        // Opening the menu leaves the first candidate highlighted.
+        open_menu(&mut app);
+        assert_eq!(selected(&app), 0);
+
+        // Arrows, Home/End, and PgUp/PgDn move the highlight (clamped).
+        app.handle_key(Key::new(Code::Down));
+        assert_eq!(selected(&app), 1);
+        app.handle_key(Key::new(Code::Down));
+        assert_eq!(selected(&app), 2);
+        app.handle_key(Key::new(Code::End));
+        assert_eq!(selected(&app), 3);
+        app.handle_key(Key::new(Code::Down));
+        assert_eq!(selected(&app), 3, "clamped at the end");
+        app.handle_key(Key::new(Code::PageDown));
+        assert_eq!(selected(&app), 3);
+        app.handle_key(Key::new(Code::Home));
+        assert_eq!(selected(&app), 0);
+        app.handle_key(Key::new(Code::PageUp));
+        assert_eq!(selected(&app), 0, "clamped at the start");
+        app.handle_key(Key::ctrl(Code::Char('n')));
+        assert_eq!(selected(&app), 1);
+        app.handle_key(Key::ctrl(Code::Char('p')));
+        assert_eq!(selected(&app), 0);
+
+        // Tab accepts the highlighted candidate without running the command.
+        app.handle_key(Key::new(Code::Down));
+        app.handle_key(Key::new(Code::Tab));
+        assert_eq!(app.input_text(), format!("r {dir}/bb.mid"));
+        assert!(app.path_completions().is_none());
+        assert_eq!(app.mode(), Mode::Command);
+
+        // Enter does the same.
+        open_menu(&mut app);
+        app.handle_key(Key::new(Code::Down));
+        app.handle_key(Key::new(Code::Down));
+        app.handle_key(Key::new(Code::Enter));
+        assert_eq!(app.input_text(), format!("r {dir}/cc.mid"));
+        assert!(app.path_completions().is_none());
+        assert_eq!(app.mode(), Mode::Command);
+
+        // Esc only closes the menu; it does not abandon the command line.
+        open_menu(&mut app);
+        app.handle_key(Key::new(Code::Esc));
+        assert!(app.path_completions().is_none());
+        assert_eq!(app.mode(), Mode::Command);
+        assert_eq!(app.input_text(), format!("r {dir}/"));
+    }
+
+    #[test]
+    fn typing_narrows_the_completion_menu() {
+        let dir =
+            std::env::temp_dir().join(format!("mtrak-app-complete-narrow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["aa.mid", "bb.mid", "cc.mid"] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let dir = dir.to_string_lossy().into_owned();
+
+        let mut app = app_with(4, 1);
+        app.handle_key(Key::ch(':'));
+        type_hex(&mut app, &format!("r {dir}/"));
+        app.handle_key(Key::new(Code::Tab));
+        assert_eq!(app.path_completions().unwrap().1.len(), 4);
+
+        // Typing narrows the match list and keeps the menu open...
+        app.handle_key(Key::ch('c'));
+        assert_eq!(app.input_text(), format!("r {dir}/c"));
+        let (values, matches, selected) = app.path_completions().unwrap();
+        assert_eq!(values[matches[selected]], format!("{dir}/cc.mid"));
+        assert_eq!(matches.len(), 1);
+        // ...and Tab accepts the only match.
+        app.handle_key(Key::new(Code::Tab));
+        assert_eq!(app.input_text(), format!("r {dir}/cc.mid"));
+        assert!(app.path_completions().is_none());
+
+        // Backspace widens the list again.
+        app.handle_key(Key::new(Code::Esc));
+        app.handle_key(Key::ch(':'));
+        type_hex(&mut app, &format!("r {dir}/"));
+        app.handle_key(Key::new(Code::Tab));
+        app.handle_key(Key::ch('c'));
+        assert_eq!(app.path_completions().unwrap().1.len(), 1);
+        app.handle_key(Key::new(Code::Backspace));
+        assert_eq!(app.input_text(), format!("r {dir}/"));
+        assert_eq!(app.path_completions().unwrap().1.len(), 4);
+
+        // Alt-Backspace removes the whole typed word.
+        app.handle_key(Key::ch('c'));
+        app.handle_key(Key::ch('c'));
+        assert_eq!(app.path_completions().unwrap().1.len(), 1);
+        app.handle_key(Key::alt(Code::Backspace));
+        assert_eq!(app.input_text(), format!("r {dir}/"));
+        assert_eq!(app.path_completions().unwrap().1.len(), 4);
+
+        // A prefix with no matches closes the menu but keeps the text.
+        for ch in "zzz".chars() {
+            app.handle_key(Key::ch(ch));
+        }
+        assert!(app.path_completions().is_none());
+        assert_eq!(app.input_text(), format!("r {dir}/zzz"));
+    }
+
+    #[test]
     fn follow_toggles_with_ctrl_f_and_the_command() {
         let mut app = app_with(8, 2);
         assert!(!app.follow_playhead());
@@ -3550,6 +4008,23 @@ mod tests {
         app.apply(Action::ToggleNoteMode);
         app.handle_key(Key::ch('z'));
         assert_eq!(sent.borrow().as_slice(), &[vec![0x90, 60, 100]]);
+    }
+
+    #[test]
+    fn tilde_is_expanded_for_file_commands() {
+        let app = app_with(4, 1);
+        let Some(home) = crate::path::home_dir() else {
+            return;
+        };
+        assert_eq!(
+            app.resolve_path(Some("~/songs/live.mid".to_string()))
+                .unwrap(),
+            home.join("songs/live.mid")
+        );
+        assert_eq!(
+            app.resolve_path(Some("/tmp/live.mid".to_string())).unwrap(),
+            std::path::PathBuf::from("/tmp/live.mid")
+        );
     }
 
     #[test]

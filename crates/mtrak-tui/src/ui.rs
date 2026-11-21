@@ -134,6 +134,9 @@ fn draw(frame: &mut Frame, app: &App) {
         draw_chooser(frame, app, area);
     }
     draw_status(frame, app, chunks[2]);
+    if app.mode() == Mode::Command {
+        draw_completions(frame, app, area);
+    }
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Area) {
@@ -183,6 +186,9 @@ fn draw_help(frame: &mut Frame, area: Area) {
         Line::raw("         o offsets  space play  : command  ctrl-n note  ctrl-s save"),
         Line::raw("         ctrl-f follow the playhead  alt-. all notes off"),
         Line::raw("Code:    alt-enter choose module  F5 reload  ctrl-z undo"),
+        Line::raw("Command: tab completes :r and :w paths (type to filter)"),
+        Line::raw("         arrows pick, tab/enter use, esc closes"),
+        Line::raw("         ctrl-a/e home/end  ctrl-k/u kill  alt-bksp word"),
     ];
     frame.render_widget(Paragraph::new(text), inner);
 }
@@ -598,6 +604,85 @@ fn draw_status(frame: &mut Frame, app: &App, area: Area) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
+/// Draws the open path-completion menu just above the status line.
+fn draw_completions(frame: &mut Frame, app: &App, area: Area) {
+    let Some((values, matches, selected)) = app.path_completions() else {
+        return;
+    };
+    if matches.is_empty() {
+        return;
+    }
+    let mut visible = matches.len().min(10);
+    let max_height = area.height.saturating_sub(1);
+    let height = (visible as u16 + 2).min(max_height);
+    if height < 3 {
+        return;
+    }
+    visible = (height - 2) as usize;
+    let offset = selected.saturating_sub(visible.saturating_sub(1));
+    // Only the rows that fit on screen matter for the width: measuring every
+    // candidate would be wasteful in directories with tens of thousands of
+    // entries.
+    let width = matches
+        .iter()
+        .skip(offset)
+        .take(visible)
+        .map(|index| completion_label(&values[*index]).chars().count())
+        .max()
+        .unwrap_or(0)
+        .saturating_add(4) as u16;
+    let width = width.max(20).min(area.width);
+    if width < 4 {
+        return;
+    }
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + area.height.saturating_sub(1 + height);
+    let popup = Area {
+        x,
+        y,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        " completions {}/{} ",
+        selected + 1,
+        matches.len()
+    ));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let lines: Vec<Line> = matches
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible)
+        .map(|(index, value)| {
+            let style = if index == selected {
+                Style::default()
+                    .bg(Color::Blue)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(completion_label(&values[*value]), style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The last path component of a completion, keeping a directory's slash.
+fn completion_label(value: &str) -> String {
+    let trimmed = value.trim_end_matches('/');
+    let name = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    if value.ends_with('/') {
+        format!("{name}/")
+    } else {
+        name.to_string()
+    }
+}
+
 fn centered(area: Area, width: u16, height: u16) -> Area {
     let width = width.min(area.width);
     let height = height.min(area.height);
@@ -797,6 +882,44 @@ mod tests {
             !marker_visible(&mut terminal, &app),
             "without follow the view stays at the cursor"
         );
+    }
+
+    #[test]
+    fn completion_menu_lists_candidates_above_the_status_line() {
+        let dir = std::env::temp_dir().join(format!("mtrak-ui-complete-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aa.mid"), b"").unwrap();
+        std::fs::write(dir.join("bb.mid"), b"").unwrap();
+        let dir = dir.to_string_lossy().into_owned();
+
+        let mut app = app_with(4, 1);
+        app.handle_key(Key::ch(':'));
+        for ch in format!("r {dir}/").chars() {
+            app.handle_key(Key::ch(ch));
+        }
+        app.handle_key(Key::new(Code::Tab));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = screen_rows(buffer);
+        assert!(
+            rows.iter().any(|line| line.contains("completions")),
+            "menu title: {rows:#?}"
+        );
+        let row = rows
+            .iter()
+            .position(|line| line.contains("aa.mid"))
+            .expect("first candidate row");
+        assert!(rows.iter().any(|line| line.contains("bb.mid")));
+        let x = rows[row].find("aa.mid").unwrap() as u16;
+        assert_eq!(
+            buffer[(x, row as u16)].bg,
+            Color::Blue,
+            "the highlighted candidate is selected"
+        );
+        // The status line is still drawn below the menu.
+        assert!(rows[23].starts_with(':'));
     }
 
     #[test]

@@ -11,9 +11,11 @@ pub mod chooser;
 pub mod clipboard;
 pub mod code;
 pub mod command;
+pub mod complete;
 pub mod edit;
 pub mod key;
 pub mod line;
+pub mod path;
 pub mod ui;
 pub mod undo;
 

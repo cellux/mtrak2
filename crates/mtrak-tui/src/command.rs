@@ -102,9 +102,9 @@ pub fn parse(input: &str) -> Result<Command, String> {
     };
 
     let command = match name.as_str() {
-        "read" | "r" => Command::Read(rest.first().map(|s| (*s).to_string())),
-        "write" | "w" => Command::Write(rest.first().map(|s| (*s).to_string())),
-        "export" => Command::Export(rest.first().map(|s| (*s).to_string())),
+        "read" | "r" => Command::Read(join_path(&rest)),
+        "write" | "w" => Command::Write(join_path(&rest)),
+        "export" => Command::Export(join_path(&rest)),
         "bpm" => Command::Bpm(int_arg(&rest, "bpm")?),
         "tpb" => Command::Tpb(int_arg(&rest, "tpb")?),
         "lpb" => Command::Lpb(int_arg(&rest, "lpb")?),
@@ -125,6 +125,16 @@ pub fn parse(input: &str) -> Result<Command, String> {
         other => return Err(format!("unknown command: {other}")),
     };
     Ok(command)
+}
+
+/// Joins the remaining words of a file command, which take one path and may
+/// contain spaces.
+fn join_path(rest: &[&str]) -> Option<String> {
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest.join(" "))
+    }
 }
 
 fn parse_scale_args(rest: &[&str]) -> Result<ScaleArgs, String> {
@@ -285,6 +295,11 @@ mod tests {
         assert_eq!(parse(":rows 64"), Ok(Command::Rows(64)));
         assert_eq!(parse(":tracks 16"), Ok(Command::Tracks(16)));
         assert_eq!(parse(":root C-4"), Ok(Command::Root("C-4".to_string())));
+        assert_eq!(
+            parse(":r my songs/live set.mid"),
+            Ok(Command::Read(Some("my songs/live set.mid".to_string()))),
+            "file commands take the rest of the line as one path"
+        );
         assert_eq!(parse(":follow"), Ok(Command::Follow));
         assert_eq!(parse(":fol"), Ok(Command::Follow));
     }
