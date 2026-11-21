@@ -181,6 +181,7 @@ fn draw_pattern(frame: &mut Frame, app: &App, area: Area) {
     let tracks = pattern.track_count();
     let lpb = pattern.lpb() as usize;
     let offsets = app.offsets_visible();
+    let npc = app.nibbles_per_cell();
     let cell_w = if offsets { 12 } else { 7 };
     let label_w = 5usize;
     let visible_tracks = (((inner.width as usize).saturating_sub(label_w)) / cell_w)
@@ -190,8 +191,8 @@ fn draw_pattern(frame: &mut Frame, app: &App, area: Area) {
     let (cursor_row, cursor_track, cursor_nibble) = app.cursor();
     let row_off = scroll_offset(cursor_row, rows, visible_rows);
     let track_off = scroll_offset(cursor_track, tracks, visible_tracks);
-    let selection = app.selection().map(|s| s.rect());
-    let affected = app.affected_rect();
+    let selection = app.selection_bounds();
+    let brush = app.brush_rect();
     let note_mode = app.mode() == Mode::Note;
     let cursor_char = if cursor_nibble < 6 {
         cursor_nibble
@@ -221,32 +222,33 @@ fn draw_pattern(frame: &mut Frame, app: &App, area: Area) {
         let mut spans = vec![Span::styled(format!("{row:04X} "), row_style)];
         for track in track_off..(track_off + visible_tracks).min(tracks) {
             let text = app.cell_display(row, track);
-            let in_selection = selection
-                .map(|s| {
-                    row >= s.top && row <= s.bottom && {
-                        let (lt, rt) = (
-                            s.left / app.nibbles_per_cell(),
-                            s.right / app.nibbles_per_cell(),
-                        );
-                        track >= lt && track <= rt
-                    }
-                })
-                .unwrap_or(false);
-            let in_affected = {
-                let (lt, rt) = affected.tracks(app.nibbles_per_cell());
-                row >= affected.top && row <= affected.bottom && track >= lt && track <= rt
-            };
-            let base = if in_selection {
-                Style::default().bg(Color::Rgb(0, 40, 90))
-            } else if in_affected {
-                Style::default().bg(Color::Rgb(0, 24, 48))
-            } else {
-                Style::default()
-            };
             let invalid_offset =
                 offsets && row == cursor_row && track == cursor_track && app.offset_invalid();
             for (i, ch) in text.chars().enumerate() {
-                let mut style = base;
+                // Map a character index to its nibble column (`+` is the
+                // offset separator and has no column).
+                let nibble = if i < 6 {
+                    Some(i)
+                } else if offsets {
+                    if i == 6 {
+                        None
+                    } else {
+                        Some(i - 1)
+                    }
+                } else {
+                    Some(i)
+                };
+                let column = nibble.map(|n| track * npc + n);
+                let in_selection = column
+                    .map(|c| selection.map(|s| s.contains(row, c)).unwrap_or(false))
+                    .unwrap_or(false);
+                let in_brush = column.map(|c| brush.contains(row, c)).unwrap_or(false);
+                let mut style = match (in_selection, in_brush) {
+                    (true, true) => Style::default().bg(Color::Rgb(0, 56, 108)),
+                    (true, false) => Style::default().bg(Color::Rgb(0, 40, 90)),
+                    (false, true) => Style::default().bg(Color::Rgb(0, 24, 48)),
+                    (false, false) => Style::default(),
+                };
                 if invalid_offset && i > 6 {
                     style = style.fg(Color::Red);
                 }
