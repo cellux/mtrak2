@@ -1605,13 +1605,15 @@ impl App {
             use std::fmt::Write;
             let _ = write!(hex, "{byte:02X}");
         }
-        let text = format!(":event {hex}");
+        // The status line draws the leading colon, so the buffer holds the
+        // command body only.
+        let text = format!("event {hex}");
         self.previous_mode = self.mode;
         self.mode = Mode::Command;
         self.command_failed = false;
         self.input = LineEditor::from_text(&text);
-        // Place the cursor on the first event nibble (after ":event ").
-        self.input.set_cursor(":event ".len());
+        // Place the cursor on the first event nibble (after "event ").
+        self.input.set_cursor("event ".len());
     }
 
     /// Executes a parsed command.
@@ -2866,8 +2868,8 @@ mod tests {
             .set_event(0, 0, note(60, 100));
         app.handle_key(Key::new(Code::Enter));
         assert_eq!(app.mode(), Mode::Command);
-        assert_eq!(app.input_text(), ":event 903C64");
-        assert_eq!(app.input_cursor(), ":event ".len());
+        assert_eq!(app.input_text(), "event 903C64");
+        assert_eq!(app.input_cursor(), "event ".len());
     }
 
     #[test]
@@ -2913,7 +2915,7 @@ mod tests {
             .unwrap()
             .set_event(0, 0, tempo.clone());
         app.handle_key(Key::new(Code::Enter));
-        assert_eq!(app.input_text(), ":event FF510307A120");
+        assert_eq!(app.input_text(), "event FF510307A120");
         app.handle_key(Key::new(Code::Enter));
         assert_eq!(slot_event(&app, 0, 0), tempo);
     }
@@ -3086,7 +3088,7 @@ mod tests {
             .unwrap()
             .set_event(0, 0, escape.clone());
         app.handle_key(Key::new(Code::Enter));
-        assert_eq!(app.input_text(), ":event F703010203");
+        assert_eq!(app.input_text(), "event F703010203");
         app.handle_key(Key::new(Code::Enter));
         assert_eq!(slot_event(&app, 0, 0), escape);
     }
