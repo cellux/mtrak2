@@ -316,6 +316,9 @@ pub struct App {
     play_micros: f64,
     play_start_row: usize,
     play_current_row: usize,
+    /// Absolute tick where the pattern ends; playback stops there even if the
+    /// last rows contain no events.
+    play_end_tick: u64,
 }
 
 impl App {
@@ -369,6 +372,7 @@ impl App {
             play_micros: 0.0,
             play_start_row: 0,
             play_current_row: 0,
+            play_end_tick: 0,
         }
     }
 
@@ -731,6 +735,10 @@ impl App {
                 let _ = self.save(None);
                 return;
             }
+            Action::AllNotesOff => {
+                self.all_notes_off();
+                return;
+            }
             _ => {}
         }
         if self.screen != Screen::Pattern {
@@ -861,7 +869,8 @@ impl App {
             | Action::OpenChooser
             | Action::ReloadLua
             | Action::Quit
-            | Action::Save => {}
+            | Action::Save
+            | Action::AllNotesOff => {}
         }
     }
 
@@ -1156,12 +1165,82 @@ impl App {
         self.delete_rows(rect.top, rect.height(), left, right, true);
     }
 
+    /// Deletes the nibble left of the cursor and steps the cursor back.
+    ///
+    /// Returns `false` at the first nibble (or when the cell cannot be edited
+    /// nibble by nibble), so block Backspace can take over.
+    fn backspace_nibble(&mut self) -> bool {
+        if self.selection_bounds().is_some() {
+            return false;
+        }
+        if self.nibble == 0 {
+            // Nothing is left of the cursor. A cell modified in this session
+            // swallows Backspace; untouched cells keep the structural delete.
+            return self.edit_recorded;
+        }
+        if self.edit.is_none() {
+            self.sync_edit();
+        }
+        if self.edit.is_none() {
+            return false;
+        }
+        let (row, track, offset_visible) = {
+            let edit = self.edit.as_ref().expect("edit buffer exists");
+            (edit.row, edit.track, edit.offset_visible)
+        };
+        self.record_edit_session();
+        let index = self.nibble - 1;
+        if let Some(edit) = self.edit.as_mut() {
+            edit.clear_nibble(index);
+        }
+        if let Some(event) = self.edit.as_ref().and_then(|edit| edit.try_event()) {
+            if let Some(slot) = self
+                .project
+                .composition
+                .pattern_mut(self.current)
+                .and_then(|pattern| pattern.slot_mut(row, track))
+            {
+                slot.event = event;
+            }
+        }
+        if offset_visible && index >= EVENT_NIBBLES {
+            let row_ticks =
+                row_ticks(self.project.composition.tpb(), self.pattern().lpb()).unwrap_or(1);
+            let valid = self
+                .edit
+                .as_ref()
+                .and_then(|edit| edit.try_offset(row_ticks));
+            if let Some(edit) = self.edit.as_mut() {
+                edit.offset_invalid = valid.is_none();
+            }
+            if let Some(value) = valid {
+                if let Some(slot) = self
+                    .project
+                    .composition
+                    .pattern_mut(self.current)
+                    .and_then(|pattern| pattern.slot_mut(row, track))
+                {
+                    slot.offset = value;
+                }
+            }
+        }
+        self.nibble = index;
+        self.dirty = true;
+        true
+    }
+
     fn backspace_block(&mut self) {
         let rect = self.cell_rect();
         self.expand_visible_selection(rect);
         let (left, right) = rect.tracks(self.nibbles_per_cell());
-        let start = rect.top.saturating_sub(rect.height());
-        self.delete_rows(start, rect.height(), left, right, true);
+        let height = rect.height();
+        let start = rect.top.saturating_sub(height);
+        // The cells at and below the cursor shift up, so the cursor steps up
+        // with them. A selection keeps its anchor and leaves the cursor alone.
+        if self.selection.is_none() {
+            self.row = self.row.saturating_sub(height);
+        }
+        self.delete_rows(start, height, left, right, true);
     }
 
     fn delete_rows(
@@ -1458,6 +1537,8 @@ impl App {
         settings.scale_aware = !self.note_chromatic;
         let note = settings.degree_to_note(degree);
         self.sync_edit();
+        // Inherit the channel and velocity already present in this cell.
+        let (channel, velocity) = self.note_defaults();
         self.record_pattern();
         // Note entry replaces the cell wholesale; drop the temporary buffer so
         // it cannot finalize over the event we are about to write.
@@ -1465,40 +1546,77 @@ impl App {
         self.edit_recorded = false;
         let event = Event::Channel(ChannelMessage::with_data(
             ChannelKind::NoteOn,
-            0,
+            channel,
             note,
-            Some(100),
+            Some(velocity),
         ));
         if let Some(pattern) = self.project.composition.pattern_mut(self.current) {
             pattern.set_event(self.row, self.track, event);
         }
-        self.audition(note);
+        self.audition(note, channel, velocity);
         let (rows, _) = self.pattern_geometry();
         self.row = (self.row + 1).min(rows.saturating_sub(1));
         self.sync_edit();
         true
     }
 
-    fn audition(&mut self, note: u8) {
+    /// The channel and velocity a new note inherits from the current cell.
+    ///
+    /// A channel-voice event supplies its channel; a note-on/note-off also
+    /// supplies its velocity. Missing parts fall back to channel 0 and
+    /// velocity 100.
+    fn note_defaults(&self) -> (u8, u8) {
+        let mut channel = 0;
+        let mut velocity = 100;
+        if let Some(slot) = self.pattern().slot(self.row, self.track) {
+            if let Event::Channel(message) = &slot.event {
+                if let Some(value) = message.channel {
+                    channel = value;
+                }
+                if matches!(message.kind, ChannelKind::NoteOn | ChannelKind::NoteOff) {
+                    if let Some(value) = message.data2 {
+                        velocity = value;
+                    }
+                }
+            }
+        }
+        (channel, velocity)
+    }
+
+    /// Plays a note while entering it.
+    ///
+    /// Only the note-on is sent: a note-off right behind it would cut the note
+    /// off before it is heard. A note that keeps ringing can be silenced with
+    /// Alt+. (All Notes Off).
+    fn audition(&mut self, note: u8, channel: u8, velocity: u8) {
         let on = Event::Channel(ChannelMessage::with_data(
             ChannelKind::NoteOn,
-            0,
+            channel,
             note,
-            Some(100),
-        ));
-        let off = Event::Channel(ChannelMessage::with_data(
-            ChannelKind::NoteOff,
-            0,
-            note,
-            Some(0),
+            Some(velocity),
         ));
         self.send(&on);
-        self.send(&off);
     }
 
     fn send(&mut self, event: &Event) {
         if let Some(midi) = self.midi.as_mut() {
             let _ = midi.send_event(event);
+        }
+    }
+
+    /// Sends an All Notes Off control change on every MIDI channel.
+    pub fn all_notes_off(&mut self) {
+        let Some(midi) = self.midi.as_mut() else {
+            return;
+        };
+        for channel in 0..16u8 {
+            let event = Event::Channel(ChannelMessage::with_data(
+                ChannelKind::ControlChange,
+                channel,
+                123,
+                Some(0),
+            ));
+            let _ = midi.send_event(&event);
         }
     }
 
@@ -2308,6 +2426,7 @@ impl App {
         let tpb = self.project.composition.tpb();
         let row_len = row_ticks(tpb, self.pattern().lpb()).unwrap_or(1) as u64;
         let base = self.play_start_row as u64 * row_len;
+        self.play_end_tick = self.pattern().row_count() as u64 * row_len;
         self.play_tick = base;
         self.play_current_row = self.play_start_row;
         self.play_next = events
@@ -2324,6 +2443,7 @@ impl App {
         self.playing = false;
         self.play_events.clear();
         self.play_next = 0;
+        self.play_end_tick = 0;
     }
 
     /// Advances playback by a wall-clock delta, sending due events.
@@ -2356,7 +2476,9 @@ impl App {
         }
         let row_len = row_ticks(tpb, self.pattern().lpb()).unwrap_or(1) as u64;
         self.play_current_row = (self.play_tick / row_len) as usize;
-        if self.play_next >= self.play_events.len() {
+        // Stop at the end of the pattern, not when the last event has been
+        // sent: trailing empty rows still belong to the pattern.
+        if self.play_tick >= self.play_end_tick {
             self.stop_playback();
         }
     }
@@ -2365,6 +2487,10 @@ impl App {
 
     /// Handles a key press according to the current mode and workspace.
     pub fn handle_key(&mut self, key: Key) {
+        // Silence is a panic button: available in every workspace and mode.
+        if key.alt && key.code == Code::Char('.') {
+            return self.all_notes_off();
+        }
         match self.mode {
             Mode::Command => return self.handle_command_key(key),
             Mode::Chooser => return self.handle_chooser_key(key),
@@ -2397,6 +2523,11 @@ impl App {
                     return;
                 }
             }
+        }
+        // Backspace edits nibbles left of the cursor before falling back to
+        // the structural block deletion.
+        if key == Key::new(Code::Backspace) && self.backspace_nibble() {
+            return;
         }
         if let Some(action) = key::lookup(key) {
             self.apply(action);
@@ -2962,6 +3093,32 @@ mod tests {
     }
 
     #[test]
+    fn playback_runs_to_the_end_of_the_pattern() {
+        // One note in the first row: playback used to stop as soon as the last
+        // event had been sent, i.e. right after the first row.
+        let mut app = app_with(8, 1);
+        app.project
+            .composition
+            .pattern_mut(PatternId(0))
+            .unwrap()
+            .set_event(0, 0, note(60, 100));
+        app.start_playback();
+        assert!(app.is_playing());
+        // 24 TPB / 4 LPB = 6 ticks per row, 8 rows = 48 ticks at 120 BPM.
+        app.tick_playback(500_000);
+        assert!(app.is_playing(), "plays past the last event");
+        app.tick_playback(500_000);
+        assert!(!app.is_playing(), "stops at the pattern end");
+
+        // A pattern without events also plays its full length.
+        let mut app = app_with(8, 1);
+        app.start_playback();
+        assert!(app.is_playing());
+        app.tick_playback(500_000);
+        assert!(app.is_playing());
+    }
+
+    #[test]
     fn follow_toggles_with_ctrl_f_and_the_command() {
         let mut app = app_with(8, 2);
         assert!(!app.follow_playhead());
@@ -3125,11 +3282,261 @@ mod tests {
     }
 
     #[test]
+    fn backspace_deletes_the_previous_nibble_and_steps_back() {
+        let mut app = app_with(4, 1);
+        app.handle_key(Key::ch('9'));
+        assert_eq!(app.cursor(), (0, 0, 1));
+        app.handle_key(Key::new(Code::Backspace));
+        assert_eq!(app.cursor(), (0, 0, 0), "the cursor steps back");
+        assert_eq!(app.cell_display(0, 0), "······", "the digit is gone");
+        assert_eq!(slot_event(&app, 0, 0), Event::Empty);
+
+        // The erased nibble can be retyped immediately.
+        app.handle_key(Key::ch('9'));
+        assert_eq!(app.cursor(), (0, 0, 1));
+        assert_eq!(app.cell_display(0, 0), "9·····");
+    }
+
+    #[test]
+    fn backspace_only_removes_the_nibble_before_the_cursor() {
+        let mut app = app_with(4, 1);
+        app.project
+            .composition
+            .pattern_mut(PatternId(0))
+            .unwrap()
+            .set_event(0, 0, note(60, 100));
+        for _ in 0..3 {
+            app.handle_key(Key::new(Code::Right));
+        }
+        assert_eq!(app.cursor(), (0, 0, 3));
+        assert_eq!(app.cell_display(0, 0), "903C64");
+
+        app.handle_key(Key::new(Code::Backspace));
+        assert_eq!(app.cursor(), (0, 0, 2));
+        assert_eq!(app.cell_display(0, 0), "90·C64");
+        assert_eq!(slot_event(&app, 0, 0), note(60, 100), "slot untouched");
+
+        // Retyping restores the complete event.
+        app.handle_key(Key::ch('3'));
+        assert_eq!(app.cursor(), (0, 0, 3));
+        assert_eq!(app.cell_display(0, 0), "903C64");
+    }
+
+    #[test]
+    fn backspace_clears_offset_nibbles_too() {
+        let mut app = app_with(4, 1);
+        app.apply(Action::ToggleOffsets);
+        assert_eq!(app.cell_display(0, 0), "······+0000");
+        for _ in 0..7 {
+            app.apply(Action::MoveRight);
+        }
+        app.handle_key(Key::ch('8'));
+        assert_eq!(app.cursor(), (0, 0, 8));
+        app.handle_key(Key::new(Code::Backspace));
+        assert_eq!(app.cursor(), (0, 0, 7));
+        assert_eq!(
+            app.cell_display(0, 0),
+            "······+0·00",
+            "the typed 8 is blanked again"
+        );
+    }
+
+    #[test]
+    fn backspace_block_moves_the_cursor_with_the_shifted_cells() {
+        let mut app = app_with(8, 1);
+        for row in 2..6 {
+            app.project
+                .composition
+                .pattern_mut(PatternId(0))
+                .unwrap()
+                .set_event(row, 0, note(60 + row as u8, 100));
+        }
+        for _ in 0..3 {
+            app.apply(Action::MoveDown);
+        }
+        assert_eq!(app.cursor().0, 3);
+
+        app.apply(Action::BackspaceBlock);
+        assert_eq!(app.cursor().0, 2, "the cursor rides the shifted cells");
+        assert_eq!(slot_event(&app, 2, 0), note(63, 100));
+        assert_eq!(slot_event(&app, 3, 0), note(64, 100));
+
+        // A taller brush shifts the same number of rows (LPB = 4 here).
+        let mut app = app_with(8, 1);
+        for row in 2..8 {
+            app.project
+                .composition
+                .pattern_mut(PatternId(0))
+                .unwrap()
+                .set_event(row, 0, note(60 + row as u8, 100));
+        }
+        for _ in 0..6 {
+            app.apply(Action::MoveDown);
+        }
+        app.apply(Action::BrushTaller);
+        app.apply(Action::BackspaceBlock);
+        assert_eq!(app.cursor().0, 2);
+        assert_eq!(slot_event(&app, 2, 0), note(66, 100));
+        assert_eq!(slot_event(&app, 3, 0), note(67, 100));
+    }
+
+    #[test]
+    fn backspace_at_the_first_nibble_keeps_block_behavior() {
+        // An untouched cell keeps the structural row-shift Backspace...
+        let mut app = app_with(4, 1);
+        app.project
+            .composition
+            .pattern_mut(PatternId(0))
+            .unwrap()
+            .set_event(1, 0, note(60, 100));
+        app.handle_key(Key::new(Code::Backspace));
+        assert_eq!(slot_event(&app, 0, 0), note(60, 100));
+
+        // ...but a cell edited in this session swallows it instead of
+        // shifting rows under the user.
+        let mut app = app_with(4, 1);
+        app.project
+            .composition
+            .pattern_mut(PatternId(0))
+            .unwrap()
+            .set_event(1, 0, note(60, 100));
+        app.handle_key(Key::ch('9'));
+        app.handle_key(Key::new(Code::Backspace));
+        assert_eq!(app.cursor(), (0, 0, 0));
+        app.handle_key(Key::new(Code::Backspace));
+        assert!(slot_event(&app, 0, 0).is_empty(), "no row shift");
+        assert_eq!(slot_event(&app, 1, 0), note(60, 100));
+    }
+
+    #[test]
     fn note_entry_uses_global_settings() {
         let mut app = app_with(8, 1);
         app.apply(Action::ToggleNoteMode);
         app.handle_key(Key::ch('z'));
         assert_eq!(slot_event(&app, 0, 0), note(60, 100));
+    }
+
+    #[test]
+    fn note_entry_inherits_channel_and_velocity_from_the_cell() {
+        let cases = [
+            // Existing note: channel and velocity are kept.
+            (
+                Event::Channel(ChannelMessage::with_data(
+                    ChannelKind::NoteOn,
+                    5,
+                    72,
+                    Some(42),
+                )),
+                Event::Channel(ChannelMessage::with_data(
+                    ChannelKind::NoteOn,
+                    5,
+                    60,
+                    Some(42),
+                )),
+            ),
+            // Non-note channel event: channel is kept, velocity is defaulted.
+            (
+                Event::Channel(ChannelMessage {
+                    kind: ChannelKind::ControlChange,
+                    channel: Some(3),
+                    data1: Some(7),
+                    data2: Some(99),
+                }),
+                Event::Channel(ChannelMessage::with_data(
+                    ChannelKind::NoteOn,
+                    3,
+                    60,
+                    Some(100),
+                )),
+            ),
+            // Only a velocity: channel is defaulted.
+            (
+                Event::Channel(ChannelMessage {
+                    kind: ChannelKind::NoteOn,
+                    channel: None,
+                    data1: Some(60),
+                    data2: Some(88),
+                }),
+                Event::Channel(ChannelMessage::with_data(
+                    ChannelKind::NoteOn,
+                    0,
+                    60,
+                    Some(88),
+                )),
+            ),
+            // Note-off velocities count too.
+            (
+                Event::Channel(ChannelMessage {
+                    kind: ChannelKind::NoteOff,
+                    channel: Some(9),
+                    data1: Some(60),
+                    data2: Some(64),
+                }),
+                Event::Channel(ChannelMessage::with_data(
+                    ChannelKind::NoteOn,
+                    9,
+                    60,
+                    Some(64),
+                )),
+            ),
+            // Only a channel: velocity is defaulted.
+            (
+                Event::Channel(ChannelMessage {
+                    kind: ChannelKind::NoteOn,
+                    channel: Some(9),
+                    data1: Some(60),
+                    data2: None,
+                }),
+                Event::Channel(ChannelMessage::with_data(
+                    ChannelKind::NoteOn,
+                    9,
+                    60,
+                    Some(100),
+                )),
+            ),
+        ];
+        for (existing, expected) in cases {
+            let mut app = app_with(8, 1);
+            app.project
+                .composition
+                .pattern_mut(PatternId(0))
+                .unwrap()
+                .set_event(0, 0, existing.clone());
+            app.apply(Action::ToggleNoteMode);
+            app.handle_key(Key::ch('z'));
+            assert_eq!(
+                slot_event(&app, 0, 0),
+                expected,
+                "existing event {existing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn note_entry_auditions_with_the_inherited_channel_and_velocity() {
+        let mut app = app_with(4, 1);
+        let backend = MockBackend::new(&["out"]);
+        let sent = backend.sent_handle();
+        let mut manager = OutputManager::new(Box::new(backend) as Box<dyn MidiBackend>);
+        manager.select(0).unwrap();
+        app.set_midi(manager);
+        app.project
+            .composition
+            .pattern_mut(PatternId(0))
+            .unwrap()
+            .set_event(
+                0,
+                0,
+                Event::Channel(ChannelMessage::with_data(
+                    ChannelKind::NoteOn,
+                    5,
+                    72,
+                    Some(42),
+                )),
+            );
+        app.apply(Action::ToggleNoteMode);
+        app.handle_key(Key::ch('z'));
+        assert_eq!(sent.borrow().as_slice(), &[vec![0x95, 60, 42]]);
     }
 
     #[test]
@@ -3142,10 +3549,30 @@ mod tests {
         app.set_midi(manager);
         app.apply(Action::ToggleNoteMode);
         app.handle_key(Key::ch('z'));
-        assert_eq!(
-            sent.borrow().as_slice(),
-            &[vec![0x90, 60, 100], vec![0x80, 60, 0]]
-        );
+        assert_eq!(sent.borrow().as_slice(), &[vec![0x90, 60, 100]]);
+    }
+
+    #[test]
+    fn alt_period_sends_all_notes_off_on_every_channel() {
+        let mut app = app_with(4, 1);
+        let backend = MockBackend::new(&["out"]);
+        let sent = backend.sent_handle();
+        let mut manager = OutputManager::new(Box::new(backend) as Box<dyn MidiBackend>);
+        manager.select(0).unwrap();
+        app.set_midi(manager);
+
+        app.handle_key(Key::alt(Code::Char('.')));
+        let messages = sent.borrow().clone();
+        assert_eq!(messages.len(), 16);
+        for (channel, message) in messages.iter().enumerate() {
+            assert_eq!(message, &[0xB0 | channel as u8, 123, 0]);
+        }
+
+        // It is a panic button: it also works away from the pattern screen.
+        sent.borrow_mut().clear();
+        app.handle_key(Key::new(Code::Function(3)));
+        app.handle_key(Key::alt(Code::Char('.')));
+        assert_eq!(sent.borrow().len(), 16);
     }
 
     #[test]

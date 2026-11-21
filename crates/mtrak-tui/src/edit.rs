@@ -83,6 +83,16 @@ impl CellEdit {
         }
     }
 
+    /// Blanks the nibble at `index`, if the cell has one.
+    pub fn clear_nibble(&mut self, index: usize) {
+        if index < EVENT_NIBBLES {
+            self.event[index] = None;
+        } else if self.offset_visible && index < EVENT_NIBBLES + OFFSET_NIBBLES {
+            self.offset[index - EVENT_NIBBLES] = None;
+            self.offset_invalid = false;
+        }
+    }
+
     /// Whether every event nibble is blank.
     pub fn event_is_blank(&self) -> bool {
         self.event.iter().all(Option::is_none)
@@ -266,6 +276,19 @@ mod tests {
             edit.set_nibble(i, nibble);
         }
         assert_eq!(edit.try_event(), Some(note()));
+    }
+
+    #[test]
+    fn clearing_a_nibble_blanks_it() {
+        let mut edit = CellEdit::blank(0, 0, true);
+        edit.set_nibble(0, 9);
+        edit.set_nibble(6, 7);
+        edit.clear_nibble(0);
+        edit.clear_nibble(6);
+        assert_eq!(edit.event_text(), "······");
+        assert_eq!(edit.offset_text(), "····");
+        // Out-of-range indices are ignored.
+        edit.clear_nibble(10);
     }
 
     #[test]

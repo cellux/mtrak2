@@ -198,6 +198,8 @@ pub enum Action {
     ToggleNoteMode,
     /// Keep the playing row in view.
     ToggleFollow,
+    /// Silence every channel.
+    AllNotesOff,
     /// Toggle chromatic note entry.
     ToggleChromatic,
     /// Undo.
@@ -214,10 +216,14 @@ pub enum Action {
 pub fn lookup(key: Key) -> Option<Action> {
     use Action as A;
     use Code::*;
-    // Alt-Enter is the portable chooser binding: unlike Ctrl-Enter it is
-    // distinguishable from plain Enter in every common terminal.
-    if key.alt && key.code == Enter {
-        return Some(A::OpenChooser);
+    // Alt-modified bindings: unlike Ctrl-Enter or Ctrl-. these are
+    // distinguishable from the plain keys in every common terminal.
+    if key.alt {
+        match key.code {
+            Enter => return Some(A::OpenChooser),
+            Char('.') => return Some(A::AllNotesOff),
+            _ => {}
+        }
     }
     let action = match (key.code, key.ctrl, key.shift) {
         (Char('q'), true, _) => A::Quit,

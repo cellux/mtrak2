@@ -139,27 +139,35 @@ fn draw(frame: &mut Frame, app: &App) {
 fn draw_header(frame: &mut Frame, app: &App, area: Area) {
     let composition = &app.project().composition;
     let note_mode = match app.mode() {
-        Mode::Note if app.note_chromatic() => "chrom",
-        Mode::Note => "scal",
+        Mode::Note | Mode::Normal if app.note_chromatic() => "chrom",
+        Mode::Note | Mode::Normal => "scal",
         Mode::Command => "cmd",
         Mode::Chooser => "choose",
-        Mode::Normal => "scal",
     };
     let screen = match app.screen() {
         Screen::Help => "HELP".to_string(),
         Screen::Pattern => format!("PAT {:02X}", app.current_pattern().value()),
         Screen::Code => format!("MOD {:02X}", app.module_id()),
     };
+    let note_style = if app.mode() == Mode::Note {
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Magenta)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
     let line = Line::from(vec![
         Span::styled(" mtrak ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(format!(
-            " BPM {}  TPB {}  {}  ROOT {}  NOTE {} ",
+            " BPM {}  TPB {}  {}  ROOT {}  ",
             composition.bpm(),
             composition.tpb(),
             screen,
             mtrak_core::settings::format_note(app.effective_settings().root),
-            note_mode,
         )),
+        Span::styled("NOTE", note_style),
+        Span::raw(format!(" {note_mode} ")),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -173,7 +181,7 @@ fn draw_help(frame: &mut Frame, area: Area) {
         Line::raw(""),
         Line::raw("Pattern: arrows move  hex types  enter edits  alt-enter choose"),
         Line::raw("         o offsets  space play  : command  ctrl-n note  ctrl-s save"),
-        Line::raw("         ctrl-f follow the playhead"),
+        Line::raw("         ctrl-f follow the playhead  alt-. all notes off"),
         Line::raw("Code:    alt-enter choose module  F5 reload  ctrl-z undo"),
     ];
     frame.render_widget(Paragraph::new(text), inner);
@@ -789,6 +797,52 @@ mod tests {
             !marker_visible(&mut terminal, &app),
             "without follow the view stays at the cursor"
         );
+    }
+
+    #[test]
+    fn note_mode_highlights_the_header_label() {
+        let mut app = app_with(4, 2);
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let note_cell = |terminal: &mut Terminal<TestBackend>, app: &App| {
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let x = screen_rows(buffer)[0].find("NOTE").expect("header label") as u16;
+            (0..4).map(|i| buffer[(x + i, 0)].bg).collect::<Vec<_>>()
+        };
+
+        assert!(note_cell(&mut terminal, &app)
+            .iter()
+            .all(|bg| *bg != Color::Magenta));
+
+        app.handle_key(Key::ctrl(Code::Char('n')));
+        assert_eq!(app.mode(), Mode::Note);
+        assert!(note_cell(&mut terminal, &app)
+            .iter()
+            .all(|bg| *bg == Color::Magenta));
+    }
+
+    #[test]
+    fn header_shows_the_note_entry_mode_in_normal_and_note_modes() {
+        let mut app = app_with(4, 2);
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let header = |terminal: &mut Terminal<TestBackend>, app: &App| {
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            screen_rows(terminal.backend().buffer())[0].clone()
+        };
+
+        assert!(header(&mut terminal, &app).contains("NOTE scal"));
+
+        // Shift-N toggles chromatic entry even outside note mode; the header
+        // must not keep claiming scale entry.
+        app.handle_key(Key::ch('N'));
+        assert!(header(&mut terminal, &app).contains("NOTE chrom"));
+
+        app.handle_key(Key::ctrl(Code::Char('n')));
+        assert_eq!(app.mode(), Mode::Note);
+        assert!(header(&mut terminal, &app).contains("NOTE chrom"));
+
+        app.handle_key(Key::ch('N'));
+        assert!(header(&mut terminal, &app).contains("NOTE scal"));
     }
 
     fn cells_with_bg(buffer: &ratatui::buffer::Buffer, bg: Color) -> Vec<(u16, u16)> {
