@@ -17,7 +17,6 @@ edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://example.invalid/mtrak"
-description = "A MIDI tracker with a reusable engine, sandboxed Lua macros, and standard MIDI I/O."
 
 [workspace.dependencies]
 mtrak-core = { path = "crates/mtrak-core" }
