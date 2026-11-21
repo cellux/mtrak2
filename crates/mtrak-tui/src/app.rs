@@ -704,12 +704,21 @@ impl App {
 
     /// Applies a navigation or editing action.
     pub fn apply(&mut self, action: Action) {
+        // Workspace-independent actions.
         match action {
             Action::HelpScreen => return self.switch_screen(Screen::Help),
             Action::PatternScreen => return self.switch_screen(Screen::Pattern),
             Action::CodeScreen => return self.switch_screen(Screen::Code),
             Action::OpenChooser => return self.open_chooser(),
             Action::ReloadLua => return self.reload_lua(),
+            Action::Quit => {
+                self.quit = true;
+                return;
+            }
+            Action::Save => {
+                let _ = self.save(None);
+                return;
+            }
             _ => {}
         }
         if self.screen != Screen::Pattern {
@@ -724,7 +733,6 @@ impl App {
             );
         let (rows, tracks) = self.pattern_geometry();
         match action {
-            Action::Quit => self.quit = true,
             Action::MoveLeft => {
                 self.cancel_selection();
                 self.move_left();
@@ -833,15 +841,14 @@ impl App {
             Action::ToggleChromatic => self.note_chromatic = !self.note_chromatic,
             Action::Undo => self.undo(),
             Action::Redo => self.redo(),
-            Action::Save => {
-                let _ = self.save(None);
-            }
             Action::OpenEventEditor => self.open_event_command(),
             Action::HelpScreen
             | Action::PatternScreen
             | Action::CodeScreen
             | Action::OpenChooser
-            | Action::ReloadLua => {}
+            | Action::ReloadLua
+            | Action::Quit
+            | Action::Save => {}
         }
     }
 
@@ -2355,6 +2362,10 @@ impl App {
         if let Code::Function(3) = key.code {
             return self.switch_screen(Screen::Code);
         }
+        // Quitting is global to every workspace.
+        if key.ctrl && key.code == Code::Char('q') {
+            return self.apply(Action::Quit);
+        }
         match self.screen {
             Screen::Code => self.handle_code_key(key),
             Screen::Pattern => self.handle_pattern_key(key),
@@ -2389,6 +2400,7 @@ impl App {
         match key.code {
             Code::Char('z') if key.ctrl => self.undo_module(),
             Code::Char('r') if key.ctrl => self.redo_module(),
+            Code::Char('s') if key.ctrl => self.apply(Action::Save),
             Code::Enter if key.alt => self.open_chooser(),
             Code::Function(5) => self.reload_lua(),
             Code::Left => self.code.move_left(),
@@ -2930,6 +2942,26 @@ mod tests {
         assert_eq!(app.screen(), Screen::Help);
         app.handle_key(Key::new(Code::Function(2)));
         assert_eq!(app.screen(), Screen::Pattern);
+    }
+
+    #[test]
+    fn ctrl_q_quits_from_every_screen() {
+        for function in [1u8, 2, 3] {
+            let mut app = app_with(4, 2);
+            app.handle_key(Key::new(Code::Function(function)));
+            app.handle_key(Key::ctrl(Code::Char('q')));
+            assert!(app.should_quit(), "ctrl-q on screen {function}");
+        }
+    }
+
+    #[test]
+    fn ctrl_s_saves_without_typing_on_the_code_screen() {
+        let mut app = app_with(4, 2);
+        app.handle_key(Key::new(Code::Function(3)));
+        let line = app.code_editor().line(0).to_vec();
+        app.handle_key(Key::ctrl(Code::Char('s')));
+        assert_eq!(app.code_editor().line(0), &line[..], "no 's' is typed");
+        assert!(!app.should_quit());
     }
 
     #[test]

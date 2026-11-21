@@ -347,7 +347,7 @@ fn draw_code(frame: &mut Frame, app: &App, area: Area) {
             Style::default().fg(Color::DarkGray),
         )];
         if line_index == cursor_line {
-            rendered.extend(cursor_spans(&spans, chars, cursor_col));
+            rendered.extend(cursor_spans(&spans, cursor_col));
         } else {
             rendered.extend(spans);
         }
@@ -378,20 +378,39 @@ fn highlight_line(chars: &[char]) -> Vec<Span<'static>> {
     rendered
 }
 
-fn cursor_spans(spans: &[Span<'static>], chars: &[char], cursor_col: usize) -> Vec<Span<'static>> {
-    let _ = spans;
-    chars
-        .iter()
-        .enumerate()
-        .map(|(i, ch)| {
-            let style = if i == cursor_col {
-                Style::default().bg(Color::Blue).fg(Color::White)
-            } else {
-                Style::default()
-            };
-            Span::styled(ch.to_string(), style)
-        })
-        .collect()
+/// Draws `spans` with the cursor cell highlighted, preserving token colors.
+///
+/// A cursor at (or past) the end of the line is shown as a reversed space, so
+/// empty lines have a visible cursor too.
+fn cursor_spans(spans: &[Span<'static>], cursor_col: usize) -> Vec<Span<'static>> {
+    let cursor_style = Style::default().bg(Color::Blue).fg(Color::White);
+    let mut rendered = Vec::new();
+    let mut index = 0usize;
+    let mut cursor_drawn = false;
+    for span in spans {
+        let chars: Vec<char> = span.content.chars().collect();
+        let mut chunk_start = 0usize;
+        for (i, ch) in chars.iter().enumerate() {
+            if index + i == cursor_col {
+                if chunk_start < i {
+                    let text: String = chars[chunk_start..i].iter().collect();
+                    rendered.push(Span::styled(text, span.style));
+                }
+                rendered.push(Span::styled(ch.to_string(), span.style.patch(cursor_style)));
+                chunk_start = i + 1;
+                cursor_drawn = true;
+            }
+        }
+        if chunk_start < chars.len() {
+            let text: String = chars[chunk_start..].iter().collect();
+            rendered.push(Span::styled(text, span.style));
+        }
+        index += chars.len();
+    }
+    if !cursor_drawn {
+        rendered.push(Span::styled(" ", cursor_style));
+    }
+    rendered
 }
 
 fn token_style(kind: TokenKind) -> Style {
@@ -731,5 +750,47 @@ mod tests {
         let buffer = terminal.backend().buffer().clone();
         assert_ne!(buffer[cell(0, 15)].bg, CHOOSER_AXIS_BG);
         assert_ne!(buffer[cell(4, 0)].bg, CHOOSER_AXIS_BG);
+    }
+
+    fn cells_with_bg(buffer: &ratatui::buffer::Buffer, bg: Color) -> Vec<(u16, u16)> {
+        (0..buffer.area.width)
+            .flat_map(|x| (0..buffer.area.height).map(move |y| (x, y)))
+            .filter(|&(x, y)| buffer[(x, y)].bg == bg)
+            .collect()
+    }
+
+    #[test]
+    fn code_cursor_is_visible_on_empty_lines_without_highlighting_the_line() {
+        let mut app = app_with(4, 2);
+        app.handle_key(Key::new(Code::Function(3)));
+        assert_eq!(app.screen(), Screen::Code);
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let render = |terminal: &mut Terminal<TestBackend>, app: &App| {
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            terminal.backend().buffer().clone()
+        };
+
+        // On the `local M = {}` line the cursor sits on `l` and the rest of
+        // the line keeps its keyword color.
+        let buffer = render(&mut terminal, &app);
+        let cursor = cells_with_bg(&buffer, Color::Blue);
+        assert_eq!(cursor.len(), 1, "exactly one cursor cell");
+        let (x, y) = cursor[0];
+        assert_eq!(buffer[(x, y)].symbol(), "l");
+        assert_eq!(buffer[(x + 1, y)].symbol(), "o");
+        assert_eq!(
+            buffer[(x + 1, y)].fg,
+            Color::Magenta,
+            "the cursor line keeps syntax colors"
+        );
+
+        // The second line of the module template is empty; the cursor must
+        // still be drawn there, without lighting up the whole line.
+        app.handle_key(Key::new(Code::Down));
+        let buffer = render(&mut terminal, &app);
+        let cursor = cells_with_bg(&buffer, Color::Blue);
+        assert_eq!(cursor.len(), 1, "the cursor is visible on an empty line");
+        assert_eq!(cursor[0], (x, y + 1));
+        assert_eq!(buffer[cursor[0]].symbol(), " ");
     }
 }
