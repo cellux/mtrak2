@@ -8,10 +8,12 @@ use std::collections::HashSet;
 
 use mtrak_core::composition::{Composition, PatternId};
 use mtrak_core::event::{macro_id, Event, MacroCall, MetaEvent};
-use mtrak_core::settings::{EffectiveSettings, Scale, Setting, Settings};
-use mtrak_core::timing::{row_ticks, Bpm, TempoMap, Ticks};
+use mtrak_core::settings::{Scale, Settings};
+use mtrak_core::timing::{row_ticks, TempoMap, Ticks};
 
-use crate::macros::{Macro, MacroAction, MacroCtx, MacroFactory, SettingChange, SettingScope};
+use crate::lua::{LuaLimits, LuaRuntime};
+
+use crate::macros::{Macro, MacroAction, MacroCtx, MacroFactory, SettingChange};
 
 /// A timestamped event emitted by the engine.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -53,9 +55,9 @@ fn kind_rank(event: &Event) -> u8 {
     match event {
         Event::Meta(MetaEvent::Tempo(_)) => 0,
         Event::Meta(MetaEvent::TimeSignature(_)) => 1,
-        Event::Meta(_) => 2,
+        Event::Meta(_) | Event::SmfEscape(_) => 2,
         Event::SysEx(_) => 3,
-        Event::Channel(_) | Event::Raw(_) => 4,
+        Event::Channel(_) | Event::Wire(_) => 4,
         Event::Macro(_) => 5,
         Event::Empty => 6,
     }
@@ -93,6 +95,7 @@ pub struct Engine {
     instances: Vec<Instance>,
     macros: Vec<MacroInstance>,
     factory: Option<Box<dyn MacroFactory>>,
+    builtins: Option<LuaRuntime>,
     sink: Option<Box<dyn Sink>>,
     output: Vec<TimedEvent>,
     diagnostics: Vec<String>,
@@ -112,6 +115,7 @@ impl Engine {
             instances: Vec::new(),
             macros: Vec::new(),
             factory: None,
+            builtins: None,
             sink: None,
             output: Vec::new(),
             diagnostics: Vec::new(),
@@ -291,10 +295,6 @@ impl Engine {
     fn handle_due(&mut self, due: Due) {
         match &due.event {
             Event::Macro(call) => self.handle_macro(due.instance, due.track, *call),
-            Event::Meta(MetaEvent::Tempo(micros)) => {
-                self.tempo.insert(self.tick, *micros);
-                self.emit(due.event.clone());
-            }
             _ => {
                 if due.event.is_complete() {
                     self.emit(due.event.clone());
@@ -304,42 +304,64 @@ impl Engine {
     }
 
     fn handle_macro(&mut self, instance: u64, track: usize, call: MacroCall) {
-        match call.id {
-            macro_id::BUILTIN_TRIGGER => {
-                let pattern = PatternId(call.arg1);
-                if self.composition.pattern(pattern).is_some() {
-                    self.trigger(instance, track, pattern);
+        let id = call.id;
+        if macro_id::is_defined_builtin(id) || macro_id::is_user(id) {
+            let created = self.factory.as_mut().and_then(|f| f.create(call));
+            match created {
+                Some(macro_) => self.push_macro(instance, track, macro_),
+                None if macro_id::is_defined_builtin(id) => {
+                    self.builtin_macro(instance, track, call);
                 }
+                None => self
+                    .diagnostics
+                    .push(format!("no runtime available for macro {id:#04X}")),
             }
-            macro_id::BUILTIN_TEMPO => {
-                if let Some(bpm) = Bpm::from_macro_args(call.arg1, call.arg2) {
-                    let micros = bpm.micros_per_quarter();
-                    self.tempo.insert(self.tick, micros);
-                    self.emit(Event::Meta(MetaEvent::Tempo(micros)));
-                }
-            }
-            id if macro_id::is_user(id) => {
-                let created = self.factory.as_mut().and_then(|f| f.create(call));
-                match created {
-                    Some(macro_) => {
-                        self.macros.push(MacroInstance {
-                            seq: self.next_id,
-                            instance,
-                            track,
-                            macro_,
-                            next_run: self.tick,
-                        });
-                        self.next_id += 1;
-                    }
-                    None => self
-                        .diagnostics
-                        .push(format!("no runtime available for user macro {id:#04X}")),
-                }
-            }
-            other => self
-                .diagnostics
-                .push(format!("undefined or reserved macro id {other:#04X}")),
+        } else {
+            self.diagnostics
+                .push(format!("undefined or reserved macro id {id:#04X}"));
         }
+    }
+
+    /// Creates a built-in macro from the engine's own Lua runtime.
+    ///
+    /// Built-in macros (`01`, `02`) are Lua modules only. This runtime is used
+    /// when the caller did not install a factory that already provides them; it
+    /// keeps the engine's built-in behavior in one implementation.
+    fn builtin_macro(&mut self, instance: u64, track: usize, call: MacroCall) {
+        if self.builtins.is_none() {
+            match LuaRuntime::new(LuaLimits::default()) {
+                Ok(runtime) => self.builtins = Some(runtime),
+                Err(error) => {
+                    self.diagnostics.push(format!(
+                        "could not create the built-in Lua runtime: {error}"
+                    ));
+                    return;
+                }
+            }
+        }
+        let created = self.builtins.as_ref().and_then(|runtime| {
+            runtime
+                .create_macro(call)
+                .ok()
+                .map(|macro_| Box::new(macro_) as Box<dyn Macro>)
+        });
+        match created {
+            Some(macro_) => self.push_macro(instance, track, macro_),
+            None => self
+                .diagnostics
+                .push(format!("no runtime available for macro {:#04X}", call.id)),
+        }
+    }
+
+    fn push_macro(&mut self, instance: u64, track: usize, macro_: Box<dyn Macro>) {
+        self.macros.push(MacroInstance {
+            seq: self.next_id,
+            instance,
+            track,
+            macro_,
+            next_run: self.tick,
+        });
+        self.next_id += 1;
     }
 
     fn run_macros(&mut self) -> bool {
@@ -392,36 +414,27 @@ impl Engine {
             MacroAction::StopTrack { include_current } => {
                 self.stop_track(instance, track, include_current, Some(caller));
             }
-            MacroAction::SetSetting { scope, change } => {
-                self.apply_setting(instance, scope, change);
+            MacroAction::SetSetting { change } => {
+                self.apply_setting(change);
             }
             MacroAction::Diagnostic(message) => self.diagnostics.push(message),
         }
     }
 
-    fn apply_setting(&mut self, instance: u64, scope: SettingScope, change: SettingChange) {
-        let pattern_id = self
-            .instances
-            .iter()
-            .find(|i| i.id == instance)
-            .map(|i| i.pattern);
-        let target = match scope {
-            SettingScope::Global => self.composition.global_settings_mut(),
-            SettingScope::Pattern => match pattern_id.and_then(|p| self.composition.pattern_mut(p))
-            {
-                Some(pattern) => pattern.settings_mut(),
-                None => return,
-            },
-        };
+    fn apply_setting(&mut self, change: SettingChange) {
+        let target = self.composition.global_settings_mut();
         match change {
-            SettingChange::Root(value) => target.root = Setting::Set(value),
-            SettingChange::Scale(mask) => target.scale = Setting::Set(Scale::from_mask(mask)),
-            SettingChange::ModalDegree(value) => target.modal_degree = Setting::Set(value),
-            SettingChange::ScaleAware(value) => target.scale_aware = Setting::Set(value),
+            SettingChange::Root(value) => target.root = value,
+            SettingChange::Scale(mask) => target.scale = Scale::from_mask(mask),
+            SettingChange::ModalDegree(value) => target.modal_degree = value,
+            SettingChange::ScaleAware(value) => target.scale_aware = value,
         }
     }
 
     fn emit(&mut self, event: Event) {
+        if let Event::Meta(MetaEvent::Tempo(micros)) = &event {
+            self.tempo.insert(self.tick, *micros);
+        }
         let tick = self.tick;
         if let Some(sink) = &mut self.sink {
             sink.emit(tick, &event);
@@ -429,13 +442,8 @@ impl Engine {
         self.output.push(TimedEvent { tick, event });
     }
 
-    fn settings_for_instance(&self, id: u64) -> EffectiveSettings {
-        if let Some(inst) = self.instances.iter().find(|i| i.id == id) {
-            if let Some(effective) = self.composition.effective_settings(inst.pattern) {
-                return effective;
-            }
-        }
-        Settings::local().resolve(self.composition.global_settings())
+    fn settings_for_instance(&self, _id: u64) -> Settings {
+        *self.composition.global_settings()
     }
 
     /// Triggers `pattern` on `track` of the instance `parent_id`, replacing any

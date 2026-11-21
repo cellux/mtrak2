@@ -7,17 +7,8 @@
 
 use mtrak_core::composition::PatternId;
 use mtrak_core::event::{Event, MacroCall};
-use mtrak_core::settings::EffectiveSettings;
+use mtrak_core::settings::Settings;
 use mtrak_core::timing::Ticks;
-
-/// The scope a macro setting change applies to.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SettingScope {
-    /// The composition-wide settings layer.
-    Global,
-    /// The invoking pattern's local settings layer.
-    Pattern,
-}
 
 /// A setting value a macro asked to change.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -44,10 +35,8 @@ pub enum MacroAction {
         /// Whether the calling coroutine is stopped too.
         include_current: bool,
     },
-    /// Change a permitted setting.
+    /// Change a composition-global setting.
     SetSetting {
-        /// Whether to change the global or the pattern-local layer.
-        scope: SettingScope,
         /// The change to apply.
         change: SettingChange,
     },
@@ -61,13 +50,13 @@ pub struct MacroCtx {
     pub tick: Ticks,
     /// The track that invoked the macro.
     pub track: usize,
-    settings: EffectiveSettings,
+    settings: Settings,
     actions: Vec<MacroAction>,
 }
 
 impl MacroCtx {
     /// Creates a context for a macro resumed at `tick` on `track`.
-    pub fn new(tick: Ticks, track: usize, settings: EffectiveSettings) -> Self {
+    pub fn new(tick: Ticks, track: usize, settings: Settings) -> Self {
         MacroCtx {
             tick,
             track,
@@ -77,7 +66,7 @@ impl MacroCtx {
     }
 
     /// The effective settings visible to the macro.
-    pub fn settings(&self) -> EffectiveSettings {
+    pub fn settings(&self) -> Settings {
         self.settings
     }
 

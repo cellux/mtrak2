@@ -31,6 +31,9 @@ pub enum EventError {
     /// A channel number outside `0..=15` was supplied.
     #[error("channel out of range: {0}")]
     ChannelOutOfRange(u8),
+    /// The byte sequence is not a valid MIDI/SMF event form.
+    #[error("invalid event bytes: {0}")]
+    InvalidWire(String),
 }
 
 /// The seven channel-voice message types.
@@ -520,10 +523,12 @@ pub enum Event {
     SysEx(Vec<u8>),
     /// A MIDI-file meta-event.
     Meta(MetaEvent),
+    /// A valid Standard MIDI File Escape event (`F7` framing); file-only.
+    SmfEscape(Vec<u8>),
     /// A tracker macro call.
     Macro(MacroCall),
-    /// Unrecognized bytes preserved verbatim.
-    Raw(Vec<u8>),
+    /// A validated generic live wire-MIDI byte sequence.
+    Wire(Vec<u8>),
 }
 
 impl Event {
@@ -537,7 +542,9 @@ impl Event {
         match self {
             Event::Empty => EventClass::Empty,
             Event::Channel(_) | Event::Macro(_) => EventClass::Inline,
-            Event::SysEx(_) | Event::Meta(_) | Event::Raw(_) => EventClass::Complex,
+            Event::SysEx(_) | Event::Meta(_) | Event::SmfEscape(_) | Event::Wire(_) => {
+                EventClass::Complex
+            }
         }
     }
 
@@ -546,27 +553,24 @@ impl Event {
         match self {
             Event::Empty => false,
             Event::Channel(m) => m.is_complete(),
-            Event::SysEx(_) | Event::Raw(_) => true,
-            Event::Meta(_) => true,
+            Event::SysEx(_) | Event::Wire(_) => true,
+            Event::Meta(_) | Event::SmfEscape(_) => true,
             Event::Macro(_) => false,
         }
     }
 
     /// Renders the event as wire-MIDI bytes for real-time output.
     ///
-    /// Meta-events and macros have no wire representation and are rejected.
+    /// File-only meta-events, SMF Escape events, and macros have no wire
+    /// representation and are rejected.
     pub fn to_midi_bytes(&self) -> Result<Vec<u8>, EventError> {
         match self {
             Event::Channel(m) => m.encode(),
-            Event::SysEx(data) => {
-                let mut out = Vec::with_capacity(data.len() + 2);
-                out.push(0xF0);
-                out.extend_from_slice(data);
-                out.push(0xF7);
-                Ok(out)
+            Event::SysEx(data) => Ok(frame_sysex(data)),
+            Event::Wire(bytes) => Ok(bytes.clone()),
+            Event::Meta(_) | Event::SmfEscape(_) => {
+                Err(EventError::Unsupported("a live MIDI message"))
             }
-            Event::Raw(bytes) => Ok(bytes.clone()),
-            Event::Meta(_) => Err(EventError::Unsupported("a live MIDI message")),
             Event::Macro(_) => Err(EventError::Unsupported("a live MIDI message")),
             Event::Empty => Err(EventError::Incomplete),
         }
@@ -583,10 +587,103 @@ impl Event {
                 out.extend_from_slice(data);
                 Ok(out)
             }
-            Event::Raw(bytes) => Ok(bytes.clone()),
+            Event::SmfEscape(data) => {
+                let mut out = vec![0xF7];
+                write_vlq(data.len() as u32, &mut out);
+                out.extend_from_slice(data);
+                Ok(out)
+            }
+            Event::Wire(bytes) => wire_to_smf(bytes),
             Event::Macro(_) => Err(EventError::Unsupported("a Standard MIDI File event")),
             Event::Empty => Err(EventError::Incomplete),
         }
+    }
+
+    /// Encodes the event in the byte form accepted by `:event`.
+    ///
+    /// Channel, sysex, and generic wire events use live wire-MIDI bytes; meta
+    /// and SMF Escape events use their standard SMF encoding; macros use their
+    /// three inline bytes.
+    pub fn to_event_bytes(&self) -> Result<Vec<u8>, EventError> {
+        match self {
+            Event::Empty => Err(EventError::Incomplete),
+            Event::Channel(m) => m.encode(),
+            Event::SysEx(data) => Ok(frame_sysex(data)),
+            Event::Meta(meta) => Ok(meta.encode()),
+            Event::SmfEscape(data) => {
+                let mut out = vec![0xF7];
+                write_vlq(data.len() as u32, &mut out);
+                out.extend_from_slice(data);
+                Ok(out)
+            }
+            Event::Macro(call) => Ok(call.bytes().to_vec()),
+            Event::Wire(bytes) => Ok(bytes.clone()),
+        }
+    }
+
+    /// Parses a `:event` byte sequence into a typed event.
+    ///
+    /// Exactly three bytes all below `0x80` are a macro call. Other input is
+    /// interpreted as an SMF meta/escape encoding or as live wire-MIDI bytes;
+    /// malformed input is rejected rather than stored.
+    pub fn from_event_bytes(bytes: &[u8]) -> Result<Event, EventError> {
+        if bytes.is_empty() {
+            return Err(EventError::Incomplete);
+        }
+        if bytes.len() == 3 && bytes.iter().all(|b| *b < 0x80) {
+            return Ok(Event::Macro(MacroCall::new(bytes[0], bytes[1], bytes[2])));
+        }
+        if bytes[0] == 0xFF {
+            if let Some(event) = parse_meta_bytes(bytes)? {
+                return Ok(event);
+            }
+        }
+        if bytes[0] == 0xF7 {
+            if let Some(event) = parse_escape_bytes(bytes)? {
+                return Ok(event);
+            }
+        }
+        if bytes[0] == 0xF0 {
+            if bytes.last() != Some(&0xF7) || bytes.len() < 2 {
+                return Err(EventError::InvalidWire(
+                    "sysex must be framed by F0 and F7".to_string(),
+                ));
+            }
+            let payload = &bytes[1..bytes.len() - 1];
+            if payload.iter().any(|b| *b >= 0x80) {
+                return Err(EventError::InvalidWire(
+                    "sysex data byte out of range".to_string(),
+                ));
+            }
+            return Ok(Event::SysEx(payload.to_vec()));
+        }
+        if (0x80..=0xEF).contains(&bytes[0]) {
+            let kind = ChannelKind::from_status_nibble(bytes[0] >> 4)
+                .ok_or(EventError::InvalidStatus(bytes[0]))?;
+            let need = kind.data_len();
+            if bytes.len() != 1 + need {
+                return Err(EventError::InvalidWire(format!(
+                    "{} needs {} data byte(s)",
+                    kind.name(),
+                    need
+                )));
+            }
+            if bytes[1..].iter().any(|b| *b >= 0x80) {
+                return Err(EventError::InvalidWire(
+                    "data byte out of range".to_string(),
+                ));
+            }
+            return Ok(Event::Channel(ChannelMessage::decode(
+                bytes[0],
+                &bytes[1..],
+            )?));
+        }
+        if is_valid_wire(bytes) {
+            return Ok(Event::Wire(bytes.to_vec()));
+        }
+        Err(EventError::InvalidWire(
+            "unrecognized MIDI byte sequence".to_string(),
+        ))
     }
 
     /// Decodes one SMF event body, returning the event and the bytes consumed.
@@ -620,6 +717,15 @@ impl Event {
                 }
                 Ok((Event::SysEx(input[start..end].to_vec()), end))
             }
+            0xF7 => {
+                let (len, used) = read_vlq(&input[1..]).map_err(|_| EventError::InvalidVlq)?;
+                let start = 1 + used;
+                let end = start + len as usize;
+                if input.len() < end {
+                    return Err(EventError::UnexpectedEof);
+                }
+                Ok((Event::SmfEscape(input[start..end].to_vec()), end))
+            }
             0x80..=0xEF => {
                 let kind = ChannelKind::from_status_nibble(status >> 4)
                     .ok_or(EventError::InvalidStatus(status))?;
@@ -642,6 +748,90 @@ impl Event {
             _ => None,
         }
     }
+}
+
+/// Frames a sysex payload with the wire `F0`/`F7` markers.
+fn frame_sysex(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 2);
+    out.push(0xF0);
+    out.extend_from_slice(payload);
+    out.push(0xF7);
+    out
+}
+
+/// Converts validated wire bytes into a faithful SMF event body.
+///
+/// Channel messages are already file-representable; a wire sysex becomes an
+/// SMF `F0` event. Every other generic wire form (system common, real-time,
+/// and undefined messages) has no faithful SMF representation and is rejected.
+fn wire_to_smf(bytes: &[u8]) -> Result<Vec<u8>, EventError> {
+    match bytes.first() {
+        Some(status) if (0x80..=0xEF).contains(status) => {
+            let kind = ChannelKind::from_status_nibble(status >> 4)
+                .ok_or(EventError::InvalidStatus(*status))?;
+            if bytes.len() == 1 + kind.data_len() && bytes[1..].iter().all(|b| *b < 0x80) {
+                Ok(bytes.to_vec())
+            } else {
+                Err(EventError::Unsupported("a Standard MIDI File event"))
+            }
+        }
+        Some(0xF0) if bytes.len() >= 2 && bytes[bytes.len() - 1] == 0xF7 => {
+            let payload = &bytes[1..bytes.len() - 1];
+            let mut out = vec![0xF0];
+            write_vlq(payload.len() as u32, &mut out);
+            out.extend_from_slice(payload);
+            Ok(out)
+        }
+        _ => Err(EventError::Unsupported("a Standard MIDI File event")),
+    }
+}
+
+/// Whether `bytes` is exactly one valid live wire system message.
+fn is_valid_wire(bytes: &[u8]) -> bool {
+    match bytes {
+        [0xF1, d] | [0xF3, d] => *d < 0x80,
+        [0xF2, a, b] => *a < 0x80 && *b < 0x80,
+        [0xF6] | [0xF7] | [0xF8] | [0xFA] | [0xFB] | [0xFC] | [0xFE] | [0xFF] => true,
+        _ => false,
+    }
+}
+
+/// Parses an exact SMF meta-event encoding (`FF type vlq data`).
+fn parse_meta_bytes(bytes: &[u8]) -> Result<Option<Event>, EventError> {
+    if bytes.len() < 2 {
+        return Ok(None);
+    }
+    let type_byte = bytes[1];
+    let (len, used) = match read_vlq(&bytes[2..]) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let start = 2 + used;
+    let end = start + len as usize;
+    if end != bytes.len() {
+        return Ok(None);
+    }
+    Ok(Some(Event::Meta(MetaEvent::from_parts(
+        type_byte,
+        bytes[start..end].to_vec(),
+    ))))
+}
+
+/// Parses an exact SMF Escape encoding (`F7 vlq data`).
+fn parse_escape_bytes(bytes: &[u8]) -> Result<Option<Event>, EventError> {
+    if bytes.len() < 2 {
+        return Ok(None);
+    }
+    let (len, used) = match read_vlq(&bytes[1..]) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let start = 1 + used;
+    let end = start + len as usize;
+    if end != bytes.len() {
+        return Ok(None);
+    }
+    Ok(Some(Event::SmfEscape(bytes[start..end].to_vec())))
 }
 
 #[cfg(test)]
@@ -824,7 +1014,7 @@ mod tests {
             EventClass::Complex
         );
         assert_eq!(Event::SysEx(vec![1]).class(), EventClass::Complex);
-        assert_eq!(Event::Raw(vec![0xAB]).class(), EventClass::Complex);
+        assert_eq!(Event::Wire(vec![0xAB]).class(), EventClass::Complex);
     }
 
     #[test]
@@ -838,5 +1028,93 @@ mod tests {
             Err(EventError::UnexpectedEof)
         );
         assert_eq!(Event::from_smf_bytes(&[]), Err(EventError::UnexpectedEof));
+    }
+
+    #[test]
+    fn event_bytes_parse_and_round_trip_every_form() {
+        let cases = vec![
+            Event::Channel(ChannelMessage::with_data(
+                ChannelKind::NoteOn,
+                3,
+                60,
+                Some(100),
+            )),
+            Event::Channel(ChannelMessage::with_data(
+                ChannelKind::ProgramChange,
+                0,
+                12,
+                None,
+            )),
+            Event::SysEx(vec![0x7D, 0x01, 0x02]),
+            Event::Meta(MetaEvent::Tempo(400_000)),
+            Event::Meta(MetaEvent::text(TextKind::Marker, b"hi".to_vec())),
+            Event::SmfEscape(vec![0x01, 0x02, 0x03]),
+            Event::Macro(MacroCall::new(0x41, 5, 6)),
+            Event::Wire(vec![0xF8]),
+            Event::Wire(vec![0xF2, 0x01, 0x02]),
+        ];
+        for event in cases {
+            let bytes = event.to_event_bytes().expect("encodable");
+            let parsed = Event::from_event_bytes(&bytes)
+                .unwrap_or_else(|e| panic!("failed to parse {bytes:02X?} from {event:?}: {e}"));
+            assert_eq!(parsed, event, "round-trip for {event:?}");
+        }
+    }
+
+    #[test]
+    fn exactly_three_low_bytes_become_a_macro() {
+        assert_eq!(
+            Event::from_event_bytes(&[0x01, 0x05, 0x00]).unwrap(),
+            Event::Macro(MacroCall::new(1, 5, 0))
+        );
+        // A channel message with the same first nibble is not a macro.
+        assert!(matches!(
+            Event::from_event_bytes(&[0x90, 0x40, 0x7F]),
+            Ok(Event::Channel(_))
+        ));
+    }
+
+    #[test]
+    fn malformed_event_bytes_are_rejected() {
+        // Odd/incomplete channel message.
+        assert!(Event::from_event_bytes(&[0x90, 0x40]).is_err());
+        // Data byte out of range.
+        assert!(Event::from_event_bytes(&[0x90, 0x40, 0xFF]).is_err());
+        // Unframed sysex.
+        assert!(Event::from_event_bytes(&[0xF0, 0x01, 0x02]).is_err());
+        // Undefined system message.
+        assert!(Event::from_event_bytes(&[0xF4]).is_err());
+        // Empty.
+        assert!(Event::from_event_bytes(&[]).is_err());
+    }
+
+    #[test]
+    fn wire_to_smf_only_succeeds_for_faithful_forms() {
+        // Channel and sysex wire forms have a faithful file representation.
+        assert_eq!(
+            Event::Wire(vec![0x90, 0x40, 0x7F]).to_smf_bytes().unwrap(),
+            vec![0x90, 0x40, 0x7F]
+        );
+        assert_eq!(
+            Event::Wire(vec![0xF0, 0x7D, 0x01, 0xF7])
+                .to_smf_bytes()
+                .unwrap(),
+            vec![0xF0, 0x02, 0x7D, 0x01]
+        );
+        // Real-time/system-common wire forms do not.
+        assert!(Event::Wire(vec![0xF8]).to_smf_bytes().is_err());
+        assert!(Event::Wire(vec![0xF2, 0x01, 0x02]).to_smf_bytes().is_err());
+        // SMF Escape has no wire representation.
+        assert!(Event::SmfEscape(vec![1]).to_midi_bytes().is_err());
+    }
+
+    #[test]
+    fn smf_escape_round_trips_through_smf_bytes() {
+        let event = Event::SmfEscape(vec![0xDE, 0xAD]);
+        let bytes = event.to_smf_bytes().unwrap();
+        assert_eq!(bytes, vec![0xF7, 0x02, 0xDE, 0xAD]);
+        let (decoded, used) = Event::from_smf_bytes(&bytes).unwrap();
+        assert_eq!(used, bytes.len());
+        assert_eq!(decoded, event);
     }
 }

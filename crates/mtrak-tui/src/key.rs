@@ -37,6 +37,8 @@ pub enum Code {
     End,
     /// Tab.
     Tab,
+    /// A function key (`1`–`12`).
+    Function(u8),
 }
 
 /// A key press with modifiers.
@@ -155,7 +157,21 @@ pub enum Action {
     /// Delete a block backward.
     BackspaceBlock,
     /// Clear the selection.
-    ClearSelection,
+    CancelSelection,
+    /// Clear every whole slot touched by the selection/brush.
+    ClearBlock,
+    /// Toggle offset visibility.
+    ToggleOffsets,
+    /// Switch to the Help screen.
+    HelpScreen,
+    /// Switch to the Pattern screen.
+    PatternScreen,
+    /// Switch to the Code screen.
+    CodeScreen,
+    /// Open the pattern/module chooser.
+    OpenChooser,
+    /// Validate/reload the project Lua runtime.
+    ReloadLua,
     /// Cut the selection.
     Cut,
     /// Copy the selection.
@@ -215,7 +231,9 @@ pub fn lookup(key: Key) -> Option<Action> {
         (Delete, false, _) => A::DeleteBlock,
         (Up, true, true) => A::DeleteBlock,
         (Backspace, false, false) => A::BackspaceBlock,
-        (Char('.'), false, _) => A::ClearSelection,
+        (Char('.'), false, _) => A::ClearBlock,
+        (Esc, false, _) => A::CancelSelection,
+        (Char('o'), false, _) => A::ToggleOffsets,
         (Char('x'), true, _) => A::Cut,
         (Char('c'), true, _) => A::Copy,
         (Char('v'), true, _) => A::Paste,
@@ -227,7 +245,12 @@ pub fn lookup(key: Key) -> Option<Action> {
         (Char('z'), true, _) => A::Undo,
         (Char('r'), true, _) => A::Redo,
         (Char('s'), true, _) => A::Save,
+        (Enter, true, _) => A::OpenChooser,
         (Enter, false, _) => A::OpenEventEditor,
+        (Function(1), false, _) => A::HelpScreen,
+        (Function(2), false, _) => A::PatternScreen,
+        (Function(3), false, _) => A::CodeScreen,
+        (Function(5), false, _) => A::ReloadLua,
         _ => return None,
     };
     Some(action)
@@ -263,7 +286,7 @@ mod tests {
             lookup(Key::new(Code::Backspace)),
             Some(Action::BackspaceBlock)
         );
-        assert_eq!(lookup(Key::ch('.')), Some(Action::ClearSelection));
+        assert_eq!(lookup(Key::ch('.')), Some(Action::ClearBlock));
         assert_eq!(lookup(Key::ctrl(Code::Char('x'))), Some(Action::Cut));
         assert_eq!(lookup(Key::ch(' ')), Some(Action::TogglePlay));
         assert_eq!(lookup(Key::ch('s')), Some(Action::SetStartRow));

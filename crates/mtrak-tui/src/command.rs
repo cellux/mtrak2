@@ -63,6 +63,8 @@ pub enum Command {
     PortList,
     /// `:port select ID`.
     PortSelect(usize),
+    /// `:event BYTES` — a hex byte sequence for the current cell.
+    Event(Vec<u8>),
     /// `:help`.
     Help,
 }
@@ -115,6 +117,7 @@ pub fn parse(input: &str) -> Result<Command, String> {
         "tracks" => Command::Tracks(int_arg(&rest, "tracks")?),
         "pattern" | "pat" => parse_pattern(&rest)?,
         "port" | "midi" => parse_port(&rest)?,
+        "event" | "ev" => Command::Event(parse_event_bytes(&rest)?),
         "help" | "h" | "?" => Command::Help,
         other => return Err(format!("unknown command: {other}")),
     };
@@ -209,6 +212,26 @@ fn parse_pattern(rest: &[&str]) -> Result<Command, String> {
         }
         other => Err(format!("unknown pattern subcommand: {other}")),
     }
+}
+
+/// Parses whitespace-separated hexadecimal bytes (or one compact hex string).
+fn parse_event_bytes(rest: &[&str]) -> Result<Vec<u8>, String> {
+    let joined: String = rest.concat();
+    if joined.is_empty() {
+        return Err("event needs a hex byte sequence".to_string());
+    }
+    if joined.len() % 2 != 0 {
+        return Err(format!("event bytes must be whole bytes: {joined}"));
+    }
+    let mut bytes = Vec::with_capacity(joined.len() / 2);
+    let chars: Vec<char> = joined.chars().collect();
+    for pair in chars.chunks(2) {
+        let text: String = pair.iter().collect();
+        let byte =
+            u8::from_str_radix(&text, 16).map_err(|_| format!("invalid event byte: {text}"))?;
+        bytes.push(byte);
+    }
+    Ok(bytes)
 }
 
 fn parse_port(rest: &[&str]) -> Result<Command, String> {
@@ -332,5 +355,29 @@ mod tests {
         assert!(parse(":nonsense").is_err());
         assert!(parse("").is_err());
         assert!(parse(":scale add bad 1234").is_err());
+    }
+
+    #[test]
+    fn event_command_parses_spaced_and_compact_hex() {
+        assert_eq!(
+            parse(":event 90 64 3F"),
+            Ok(Command::Event(vec![0x90, 0x64, 0x3F]))
+        );
+        assert_eq!(
+            parse(":event 90643F"),
+            Ok(Command::Event(vec![0x90, 0x64, 0x3F]))
+        );
+        assert_eq!(
+            parse(":ev F0 7D 01 02 F7"),
+            Ok(Command::Event(vec![0xF0, 0x7D, 0x01, 0x02, 0xF7]))
+        );
+    }
+
+    #[test]
+    fn event_command_rejects_malformed_hex() {
+        assert!(parse(":event").is_err());
+        assert!(parse(":event 9").is_err());
+        assert!(parse(":event 90 6").is_err());
+        assert!(parse(":event 90 zz").is_err());
     }
 }

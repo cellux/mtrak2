@@ -13,8 +13,7 @@ name = "mtrak"
 path = "src/main.rs"
 
 [features]
-default = ["lua", "midir"]
-lua = ["mtrak-engine/lua"]
+default = ["midir"]
 midir = ["mtrak-midi/midir-backend"]
 
 [dependencies]

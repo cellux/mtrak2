@@ -1,23 +1,29 @@
-//! Sandboxed Lua macro runtime (phase P5).
+//! Sandboxed Lua macro runtime.
 //!
 //! Modules are compiled with an empty `_ENV` that exposes only the injected API
 //! and a curated standard library, so there is no filesystem, network, process,
 //! `os`, `io`, `debug`, `package`, or FFI access (decision D-004). Each macro
 //! runs as a coroutine that the scheduler resumes once per tick; instruction and
 //! memory limits keep a runaway macro from corrupting engine state (D-026).
+//!
+//! The remaining-gaps milestone migrated the built-in macros to inspectable Lua
+//! modules (`01` trigger, `02` Q8.8 tempo shorthand), made module `00` an
+//! editable project/library module whose setup side effects run once, and added
+//! numeric-hexadecimal `require` with caching and circular-dependency checks.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use mlua::{Function, HookTriggers, Lua, MultiValue, Table, Thread, ThreadStatus, Value, VmState};
 
 use mtrak_core::composition::PatternId;
 use mtrak_core::event::{macro_id, ChannelKind, ChannelMessage, Event, MacroCall, MetaEvent};
-use mtrak_core::settings::{EffectiveSettings, Scale, Setting, Settings};
+use mtrak_core::modules::BUILTIN_MODULES;
+use mtrak_core::settings::{Scale, Settings};
 use mtrak_core::timing::Ticks;
 
-use crate::macros::{Macro, MacroAction, MacroCtx, MacroFactory, SettingChange, SettingScope};
+use crate::macros::{Macro, MacroAction, MacroCtx, MacroFactory, SettingChange};
 
 /// Interval, in VM instructions, between instruction-budget hook checks.
 const HOOK_INTERVAL: u32 = 1_000;
@@ -34,7 +40,7 @@ pub enum LuaError {
     /// An error propagated from the embedded Lua state.
     #[error("lua error: {0}")]
     Lua(#[from] mlua::Error),
-    /// The macro ID is not in the user-authorable range (`40`–`7F`).
+    /// The macro ID is not a user module ID (`40`–`7F`).
     #[error("macro id {0:#04X} is not a user macro id")]
     NotUserMacro(u8),
     /// No module was loaded for the macro ID.
@@ -43,6 +49,9 @@ pub enum LuaError {
     /// Too many live coroutines are already running.
     #[error("the live coroutine limit has been reached")]
     TooManyCoroutines,
+    /// The macro ID is reserved or an undefined built-in.
+    #[error("macro id {0:#04X} is reserved or undefined")]
+    ReservedMacro(u8),
 }
 
 /// A project command registered by the setup module.
@@ -78,19 +87,9 @@ impl Default for LuaLimits {
 #[derive(Default)]
 struct RuntimeState {
     actions: Vec<MacroAction>,
-    settings: Option<EffectiveSettings>,
+    settings: Option<Settings>,
     track: usize,
     tick: Ticks,
-}
-
-struct ResumeInput<'a> {
-    thread: &'a Thread,
-    started: bool,
-    arg1: u8,
-    arg2: u8,
-    tick: Ticks,
-    track: usize,
-    settings: EffectiveSettings,
 }
 
 enum ResumeOutcome {
@@ -99,8 +98,10 @@ enum ResumeOutcome {
 }
 
 struct Inner {
-    lua: Lua,
+    sources: HashMap<u8, String>,
     modules: HashMap<u8, Function>,
+    cache: HashMap<u8, Value>,
+    loading: HashSet<u8>,
     shared: Rc<RefCell<RuntimeState>>,
     commands: Rc<RefCell<Vec<RegisteredCommand>>>,
     handlers: Rc<RefCell<HashMap<String, Function>>>,
@@ -112,17 +113,25 @@ struct Inner {
 /// The shared Lua runtime used to create macro coroutines.
 #[derive(Clone)]
 pub struct LuaRuntime {
+    lua: Lua,
     inner: Rc<RefCell<Inner>>,
 }
 
 impl LuaRuntime {
-    /// Creates a new sandboxed runtime with the given limits.
+    /// Creates a new sandboxed runtime with the given limits and the built-in
+    /// module sources pre-registered.
     pub fn new(limits: LuaLimits) -> Result<Self, LuaError> {
         let lua = Lua::new();
         lua.set_memory_limit(limits.memory_bytes)?;
+        let mut sources = HashMap::new();
+        for (id, source) in BUILTIN_MODULES {
+            sources.insert(*id, (*source).to_string());
+        }
         let inner = Inner {
-            lua,
+            sources,
             modules: HashMap::new(),
+            cache: HashMap::new(),
+            loading: HashSet::new(),
             shared: Rc::new(RefCell::new(RuntimeState::default())),
             commands: Rc::new(RefCell::new(Vec::new())),
             handlers: Rc::new(RefCell::new(HashMap::new())),
@@ -131,44 +140,65 @@ impl LuaRuntime {
             live: 0,
         };
         Ok(LuaRuntime {
+            lua,
             inner: Rc::new(RefCell::new(inner)),
         })
     }
 
-    /// Loads a user macro module (`40`–`7F`) defining `run(arg1, arg2, context)`.
+    /// Stores a module source without evaluating it. Used for lazy loading.
+    pub fn set_module_source(&self, id: u8, source: &str) {
+        let mut inner = self.inner.borrow_mut();
+        inner.sources.insert(id, source.to_string());
+        inner.cache.remove(&id);
+        inner.modules.remove(&id);
+    }
+
+    /// Loads a user macro module (`40`–`7F`) defining `run(arg1, arg2, ctx)`.
+    ///
+    /// The module is evaluated immediately so syntax errors surface at load.
     pub fn load_module(&self, id: u8, source: &str) -> Result<(), LuaError> {
         if !macro_id::is_user(id) {
             return Err(LuaError::NotUserMacro(id));
         }
-        let mut inner = self.inner.borrow_mut();
-        let env = inner.make_env(false)?;
-        let name = format!("macro {id:02X}");
-        let result: Value = inner
-            .lua
-            .load(source)
-            .set_name(name)
-            .set_environment(env.clone())
-            .eval()?;
-        let run = match result {
-            Value::Function(f) => f,
-            Value::Table(t) => t.get::<Function>("run")?,
-            Value::Nil => env.get::<Function>("run")?,
-            _ => return Err(LuaError::UnknownModule(id)),
-        };
-        inner.modules.insert(id, run);
-        Ok(())
+        self.set_module_source(id, source);
+        ensure_module(&self.lua, &self.inner, id, false).map(|_| ())
     }
 
-    /// Executes the project setup module (`00`), which may register commands.
+    /// Executes the project setup module (`00`), which may register commands and
+    /// perform one-time side effects. Its returned value is cached for
+    /// `require(0x00)`.
     pub fn run_setup(&self, source: &str) -> Result<(), LuaError> {
-        let inner = self.inner.borrow_mut();
-        let env = inner.make_env(true)?;
-        inner
-            .lua
-            .load(source)
-            .set_name("setup")
-            .set_environment(env)
-            .exec()?;
+        self.set_module_source(macro_id::SETUP, source);
+        ensure_module(&self.lua, &self.inner, macro_id::SETUP, true).map(|_| ())
+    }
+
+    /// Clears every cached module value and re-evaluates all stored sources.
+    ///
+    /// Used by the explicit `F5` reload path in the Code screen.
+    pub fn reload(&self) -> Result<(), LuaError> {
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.cache.clear();
+            inner.modules.clear();
+            inner.loading.clear();
+            inner.commands.borrow_mut().clear();
+            inner.handlers.borrow_mut().clear();
+        }
+        self.validate()
+    }
+
+    /// Evaluates every stored module source, surfacing the first error.
+    pub fn validate(&self) -> Result<(), LuaError> {
+        let ids: Vec<u8> = {
+            let inner = self.inner.borrow();
+            let mut ids: Vec<u8> = inner.sources.keys().copied().collect();
+            ids.sort_unstable();
+            ids
+        };
+        for id in ids {
+            let allow_register = id == macro_id::SETUP;
+            ensure_module(&self.lua, &self.inner, id, allow_register)?;
+        }
         Ok(())
     }
 
@@ -177,27 +207,47 @@ impl LuaRuntime {
         self.inner.borrow().commands.borrow().clone()
     }
 
-    /// Creates a macro coroutine for a user macro call.
+    /// The cached return value of module `id`, if it has been loaded.
+    pub fn module_value(&self, id: u8) -> Option<Value> {
+        self.inner.borrow().cache.get(&id).cloned()
+    }
+
+    /// Whether a module source is available for `id`.
+    pub fn has_module(&self, id: u8) -> bool {
+        self.inner.borrow().sources.contains_key(&id)
+    }
+
+    /// Creates a macro coroutine for a built-in or user macro call.
     pub fn create_macro(&self, call: MacroCall) -> Result<LuaMacro, LuaError> {
-        if !macro_id::is_user(call.id) {
-            return Err(LuaError::NotUserMacro(call.id));
+        let id = call.id;
+        let defined_builtin = macro_id::is_defined_builtin(id);
+        if !defined_builtin && !macro_id::is_user(id) {
+            return Err(LuaError::ReservedMacro(id));
         }
-        let mut inner = self.inner.borrow_mut();
-        if inner.live >= inner.limits.max_live_coroutines {
-            return Err(LuaError::TooManyCoroutines);
+        {
+            let inner = self.inner.borrow();
+            if inner.live >= inner.limits.max_live_coroutines {
+                return Err(LuaError::TooManyCoroutines);
+            }
+            if !inner.sources.contains_key(&id) {
+                return Err(LuaError::UnknownModule(id));
+            }
         }
-        let run = inner
+        ensure_module(&self.lua, &self.inner, id, false)?;
+        let run = self
+            .inner
+            .borrow()
             .modules
-            .get(&call.id)
+            .get(&id)
             .cloned()
-            .ok_or(LuaError::UnknownModule(call.id))?;
-        let body: Function = inner
+            .ok_or(LuaError::UnknownModule(id))?;
+        let body: Function = self
             .lua
             .load("local run = ...; return function(a1, a2, ctx) return run(a1, a2, ctx) end")
             .call(run)?;
-        let thread = inner.lua.create_thread(body)?;
-        if inner.limits.instructions_per_tick > 0 {
-            let fuel = inner.fuel.clone();
+        let thread = self.lua.create_thread(body)?;
+        if self.inner.borrow().limits.instructions_per_tick > 0 {
+            let fuel = self.inner.borrow().fuel.clone();
             let triggers = HookTriggers::new().every_nth_instruction(HOOK_INTERVAL);
             thread.set_hook(triggers, move |_lua, _debug| {
                 let remaining = fuel.get();
@@ -210,8 +260,9 @@ impl LuaRuntime {
                 Ok(VmState::Continue)
             });
         }
-        inner.live += 1;
+        self.inner.borrow_mut().live += 1;
         Ok(LuaMacro {
+            lua: self.lua.clone(),
             inner: self.inner.clone(),
             thread,
             arg1: call.arg1,
@@ -222,217 +273,239 @@ impl LuaRuntime {
     }
 }
 
-impl Inner {
-    fn make_env(&self, allow_register: bool) -> mlua::Result<Table> {
-        let env = self.lua.create_table()?;
-        self.install_api(&env, allow_register)?;
-        Ok(env)
+/// Evaluates a module source (once) and returns its cached return value.
+fn ensure_module(
+    lua: &Lua,
+    inner: &Rc<RefCell<Inner>>,
+    id: u8,
+    allow_register: bool,
+) -> Result<Value, LuaError> {
+    {
+        let state = inner.borrow();
+        if let Some(value) = state.cache.get(&id) {
+            return Ok(value.clone());
+        }
+        if state.loading.contains(&id) {
+            return Err(LuaError::Lua(mlua::Error::RuntimeError(format!(
+                "circular require of module {id:02X}"
+            ))));
+        }
+        if !state.sources.contains_key(&id) {
+            return Err(LuaError::UnknownModule(id));
+        }
     }
+    let source = inner
+        .borrow()
+        .sources
+        .get(&id)
+        .cloned()
+        .ok_or(LuaError::UnknownModule(id))?;
+    inner.borrow_mut().loading.insert(id);
 
-    fn install_api(&self, env: &Table, allow_register: bool) -> mlua::Result<()> {
-        let shared = self.shared.clone();
-        env.set(
-            "emit",
-            self.lua.create_function(move |_, args: MultiValue| {
-                let mut it = args.into_iter();
-                let status = it.next().and_then(|v| v.as_integer()).unwrap_or(0) as u8;
-                let data1 = it.next().and_then(|v| v.as_integer()).map(|v| v as u8);
-                let data2 = it.next().and_then(|v| v.as_integer()).map(|v| v as u8);
-                shared
-                    .borrow_mut()
-                    .actions
-                    .push(MacroAction::Emit(channel_event(status, data1, data2)));
-                Ok(())
-            })?,
-        )?;
+    let outcome = (|| -> Result<Value, LuaError> {
+        let env = make_env(lua, inner, allow_register)?;
+        let value: Value = lua
+            .load(&source)
+            .set_name(format!("module {id:02X}"))
+            .set_environment(env.clone())
+            .eval()?;
+        let run = match &value {
+            Value::Function(function) => Some(function.clone()),
+            Value::Table(table) => table.get::<Function>("run").ok(),
+            Value::Nil => env.get::<Function>("run").ok(),
+            _ => None,
+        };
+        {
+            let mut state = inner.borrow_mut();
+            if let Some(run) = run {
+                state.modules.insert(id, run);
+            }
+            state.cache.insert(id, value.clone());
+        }
+        Ok(value)
+    })();
+    inner.borrow_mut().loading.remove(&id);
+    outcome
+}
 
-        let shared = self.shared.clone();
-        env.set(
-            "emit_sysex",
-            self.lua.create_function(move |_, data: Vec<u8>| {
-                shared
-                    .borrow_mut()
-                    .actions
-                    .push(MacroAction::Emit(Event::SysEx(data)));
-                Ok(())
-            })?,
-        )?;
+fn make_env(
+    lua: &Lua,
+    inner: &Rc<RefCell<Inner>>,
+    allow_register: bool,
+) -> Result<Table, LuaError> {
+    let env = lua.create_table()?;
+    install_api(lua, inner, &env, allow_register)?;
+    Ok(env)
+}
 
-        let shared = self.shared.clone();
-        env.set(
-            "emit_meta",
-            self.lua
-                .create_function(move |_, (kind, data): (u8, Vec<u8>)| {
-                    shared
-                        .borrow_mut()
-                        .actions
-                        .push(MacroAction::Emit(Event::Meta(MetaEvent::from_parts(
-                            kind, data,
-                        ))));
-                    Ok(())
-                })?,
-        )?;
+fn install_api(
+    lua: &Lua,
+    inner: &Rc<RefCell<Inner>>,
+    env: &Table,
+    allow_register: bool,
+) -> mlua::Result<()> {
+    let (shared, commands, handlers) = {
+        let state = inner.borrow();
+        (
+            state.shared.clone(),
+            state.commands.clone(),
+            state.handlers.clone(),
+        )
+    };
 
-        let shared = self.shared.clone();
-        env.set(
-            "trigger",
-            self.lua.create_function(move |_, id: i64| {
-                shared
-                    .borrow_mut()
-                    .actions
-                    .push(MacroAction::Trigger(PatternId(id as u8)));
-                Ok(())
-            })?,
-        )?;
+    let shared_emit = shared.clone();
+    env.set(
+        "emit",
+        lua.create_function(move |_, args: MultiValue| {
+            let mut it = args.into_iter();
+            let status = it.next().and_then(|v| v.as_integer()).unwrap_or(0) as u8;
+            let data1 = it.next().and_then(|v| v.as_integer()).map(|v| v as u8);
+            let data2 = it.next().and_then(|v| v.as_integer()).map(|v| v as u8);
+            shared_emit
+                .borrow_mut()
+                .actions
+                .push(MacroAction::Emit(channel_event(status, data1, data2)));
+            Ok(())
+        })?,
+    )?;
 
-        let shared = self.shared.clone();
-        env.set(
-            "stop_track",
-            self.lua.create_function(move |_, include: Option<bool>| {
-                shared.borrow_mut().actions.push(MacroAction::StopTrack {
+    let shared_sysex = shared.clone();
+    env.set(
+        "emit_sysex",
+        lua.create_function(move |_, data: Vec<u8>| {
+            shared_sysex
+                .borrow_mut()
+                .actions
+                .push(MacroAction::Emit(Event::SysEx(data)));
+            Ok(())
+        })?,
+    )?;
+
+    let shared_meta = shared.clone();
+    env.set(
+        "emit_meta",
+        lua.create_function(move |_, (kind, data): (u8, Vec<u8>)| {
+            shared_meta
+                .borrow_mut()
+                .actions
+                .push(MacroAction::Emit(Event::Meta(MetaEvent::from_parts(
+                    kind, data,
+                ))));
+            Ok(())
+        })?,
+    )?;
+
+    let shared_trigger = shared.clone();
+    env.set(
+        "trigger",
+        lua.create_function(move |_, id: i64| {
+            shared_trigger
+                .borrow_mut()
+                .actions
+                .push(MacroAction::Trigger(PatternId(id as u8)));
+            Ok(())
+        })?,
+    )?;
+
+    let shared_stop = shared.clone();
+    env.set(
+        "stop_track",
+        lua.create_function(move |_, include: Option<bool>| {
+            shared_stop
+                .borrow_mut()
+                .actions
+                .push(MacroAction::StopTrack {
                     include_current: include.unwrap_or(true),
                 });
+            Ok(())
+        })?,
+    )?;
+
+    let shared_get = shared.clone();
+    env.set(
+        "get_setting",
+        lua.create_function(move |_, name: String| {
+            let settings = shared_get.borrow().settings;
+            Ok(settings
+                .map(|s| read_setting(s, &name))
+                .unwrap_or(Value::Nil))
+        })?,
+    )?;
+
+    let shared_set = shared.clone();
+    env.set(
+        "set_setting",
+        lua.create_function(move |_, (name, value): (String, Value)| {
+            let Some(change) = setting_change(&name, &value) else {
+                return Ok(false);
+            };
+            let mut state = shared_set.borrow_mut();
+            // Reflect the change immediately so later reads in the same resume
+            // observe it; the engine applies it authoritatively.
+            if let Some(settings) = state.settings.as_mut() {
+                apply_change(settings, &change);
+            }
+            state.actions.push(MacroAction::SetSetting { change });
+            Ok(true)
+        })?,
+    )?;
+
+    let wait: Function = lua
+        .load("return function(n) return coroutine.yield(n) end")
+        .eval()?;
+    env.set("wait", wait)?;
+
+    let require_inner = inner.clone();
+    env.set(
+        "require",
+        lua.create_function(move |lua, id: i64| {
+            if !(0..=255).contains(&id) {
+                return Err(mlua::Error::RuntimeError(
+                    "require id must be in 0x00..=0xFF".to_string(),
+                ));
+            }
+            ensure_module(lua, &require_inner, id as u8, false)
+                .map_err(|error| mlua::Error::RuntimeError(error.to_string()))
+        })?,
+    )?;
+
+    let globals = lua.globals();
+    for name in SAFE_GLOBALS {
+        if let Ok(value) = globals.get::<Value>(*name) {
+            if !matches!(value, Value::Nil) {
+                env.set(*name, value)?;
+            }
+        }
+    }
+
+    if allow_register {
+        let commands = commands.clone();
+        let handlers = handlers.clone();
+        env.set(
+            "register_command",
+            lua.create_function(move |_, args: MultiValue| {
+                let mut it = args.into_iter();
+                let name = it.next().and_then(|v| v.as_string_lossy()).ok_or_else(|| {
+                    mlua::Error::RuntimeError("register_command requires a name".to_string())
+                })?;
+                let description = it.next().and_then(|v| v.as_string_lossy());
+                if let Some(Value::Function(handler)) = it.next() {
+                    handlers.borrow_mut().insert(name.clone(), handler);
+                }
+                commands
+                    .borrow_mut()
+                    .push(RegisteredCommand { name, description });
                 Ok(())
             })?,
         )?;
-
-        let shared = self.shared.clone();
-        env.set(
-            "get_setting",
-            self.lua.create_function(move |_, name: String| {
-                let settings = shared.borrow().settings;
-                Ok(settings
-                    .map(|s| read_setting(s, &name))
-                    .unwrap_or(Value::Nil))
-            })?,
-        )?;
-
-        let shared = self.shared.clone();
-        env.set(
-            "set_setting",
-            self.lua.create_function(
-                move |_, (name, value, scope): (String, Value, Option<String>)| {
-                    let Some(change) = setting_change(&name, &value) else {
-                        return Ok(false);
-                    };
-                    let scope = match scope.as_deref() {
-                        Some("global") => SettingScope::Global,
-                        _ => SettingScope::Pattern,
-                    };
-                    let mut state = shared.borrow_mut();
-                    // Reflect the change immediately so later reads in the same
-                    // resume observe it; the engine applies it authoritatively.
-                    if let Some(settings) = state.settings.as_mut() {
-                        match change {
-                            SettingChange::Root(v) => settings.root = v,
-                            SettingChange::Scale(mask) => {
-                                settings.scale = Scale::from_mask(mask);
-                            }
-                            SettingChange::ModalDegree(v) => settings.modal_degree = v,
-                            SettingChange::ScaleAware(v) => settings.scale_aware = v,
-                        }
-                    }
-                    state
-                        .actions
-                        .push(MacroAction::SetSetting { scope, change });
-                    Ok(true)
-                },
-            )?,
-        )?;
-
-        let wait: Function = self
-            .lua
-            .load("return function(n) return coroutine.yield(n) end")
-            .eval()?;
-        env.set("wait", wait)?;
-
-        let globals = self.lua.globals();
-        for name in SAFE_GLOBALS {
-            if let Ok(value) = globals.get::<Value>(*name) {
-                if !matches!(value, Value::Nil) {
-                    env.set(*name, value)?;
-                }
-            }
-        }
-
-        if allow_register {
-            let commands = self.commands.clone();
-            let handlers = self.handlers.clone();
-            env.set(
-                "register_command",
-                self.lua.create_function(move |_, args: MultiValue| {
-                    let mut it = args.into_iter();
-                    let name = it.next().and_then(|v| v.as_string_lossy()).ok_or_else(|| {
-                        mlua::Error::RuntimeError("register_command requires a name".to_string())
-                    })?;
-                    let description = it.next().and_then(|v| v.as_string_lossy());
-                    if let Some(Value::Function(handler)) = it.next() {
-                        handlers.borrow_mut().insert(name.clone(), handler);
-                    }
-                    commands
-                        .borrow_mut()
-                        .push(RegisteredCommand { name, description });
-                    Ok(())
-                })?,
-            )?;
-        }
-
-        Ok(())
     }
 
-    fn resume(
-        &mut self,
-        input: ResumeInput<'_>,
-    ) -> Result<(ResumeOutcome, Vec<MacroAction>), LuaError> {
-        let ResumeInput {
-            thread,
-            started,
-            arg1,
-            arg2,
-            tick,
-            track,
-            settings,
-        } = input;
-        {
-            let mut state = self.shared.borrow_mut();
-            state.actions.clear();
-            state.settings = Some(settings);
-            state.track = track;
-            state.tick = tick;
-        }
-        let steps = (self.limits.instructions_per_tick / HOOK_INTERVAL).max(1) as u64;
-        self.fuel.set(steps);
-
-        let result = if started {
-            thread.resume::<MultiValue>(())
-        } else {
-            let context = context_table(&self.lua, settings, track, tick)?;
-            thread.resume::<MultiValue>((i64::from(arg1), i64::from(arg2), context))
-        };
-        let actions = std::mem::take(&mut self.shared.borrow_mut().actions);
-        match result {
-            Ok(values) => {
-                if thread.status() == ThreadStatus::Finished {
-                    self.live = self.live.saturating_sub(1);
-                    Ok((ResumeOutcome::Finished, actions))
-                } else {
-                    Ok((ResumeOutcome::Wait(yield_ticks(&values)), actions))
-                }
-            }
-            Err(mlua::Error::CoroutineUnresumable) => {
-                self.live = self.live.saturating_sub(1);
-                Ok((ResumeOutcome::Finished, actions))
-            }
-            Err(error) => {
-                self.live = self.live.saturating_sub(1);
-                Err(LuaError::Lua(error))
-            }
-        }
-    }
+    Ok(())
 }
 
 /// A macro coroutine backed by a Lua `Thread`.
 pub struct LuaMacro {
+    lua: Lua,
     inner: Rc<RefCell<Inner>>,
     thread: Thread,
     arg1: u8,
@@ -446,18 +519,7 @@ impl Macro for LuaMacro {
         if self.done {
             return None;
         }
-        let outcome = {
-            let mut inner = self.inner.borrow_mut();
-            inner.resume(ResumeInput {
-                thread: &self.thread,
-                started: self.started,
-                arg1: self.arg1,
-                arg2: self.arg2,
-                tick: ctx.tick,
-                track: ctx.track,
-                settings: ctx.settings(),
-            })
-        };
+        let outcome = self.resume_inner(ctx);
         self.started = true;
         match outcome {
             Ok((ResumeOutcome::Wait(ticks), actions)) => {
@@ -477,6 +539,64 @@ impl Macro for LuaMacro {
                 self.done = true;
                 ctx.push(MacroAction::Diagnostic(error.to_string()));
                 None
+            }
+        }
+    }
+}
+
+impl LuaMacro {
+    fn resume_inner(
+        &mut self,
+        ctx: &mut MacroCtx,
+    ) -> Result<(ResumeOutcome, Vec<MacroAction>), LuaError> {
+        let shared = {
+            let state = self.inner.borrow();
+            state.shared.clone()
+        };
+        {
+            let mut state = shared.borrow_mut();
+            state.actions.clear();
+            state.settings = Some(ctx.settings());
+            state.track = ctx.track;
+            state.tick = ctx.tick;
+        }
+        let steps = {
+            let inner = self.inner.borrow();
+            let fuel = inner.fuel.clone();
+            let steps = (inner.limits.instructions_per_tick / HOOK_INTERVAL).max(1) as u64;
+            fuel.set(steps);
+            steps
+        };
+        let _ = steps;
+
+        let result = if self.started {
+            self.thread.resume::<MultiValue>(())
+        } else {
+            let context = context_table(&self.lua, ctx.settings(), ctx.track, ctx.tick)?;
+            self.thread
+                .resume::<MultiValue>((i64::from(self.arg1), i64::from(self.arg2), context))
+        };
+        let actions = std::mem::take(&mut shared.borrow_mut().actions);
+        let finish = |inner: &Rc<RefCell<Inner>>| {
+            let live = inner.borrow().live.saturating_sub(1);
+            inner.borrow_mut().live = live;
+        };
+        match result {
+            Ok(values) => {
+                if self.thread.status() == ThreadStatus::Finished {
+                    finish(&self.inner);
+                    Ok((ResumeOutcome::Finished, actions))
+                } else {
+                    Ok((ResumeOutcome::Wait(yield_ticks(&values)), actions))
+                }
+            }
+            Err(mlua::Error::CoroutineUnresumable) => {
+                finish(&self.inner);
+                Ok((ResumeOutcome::Finished, actions))
+            }
+            Err(error) => {
+                finish(&self.inner);
+                Err(LuaError::Lua(error))
             }
         }
     }
@@ -503,12 +623,7 @@ impl MacroFactory for LuaMacroFactory {
     }
 }
 
-fn context_table(
-    lua: &Lua,
-    settings: EffectiveSettings,
-    track: usize,
-    tick: Ticks,
-) -> mlua::Result<Table> {
+fn context_table(lua: &Lua, settings: Settings, track: usize, tick: Ticks) -> mlua::Result<Table> {
     let context = lua.create_table()?;
     context.set("track", track as i64)?;
     context.set("tick", tick as i64)?;
@@ -546,12 +661,12 @@ fn channel_event(status: u8, data1: Option<u8>, data2: Option<u8>) -> Event {
             if let Some(d) = data2 {
                 bytes.push(d);
             }
-            Event::Raw(bytes)
+            Event::Wire(bytes)
         }
     }
 }
 
-fn read_setting(settings: EffectiveSettings, name: &str) -> Value {
+fn read_setting(settings: Settings, name: &str) -> Value {
     match name {
         "root" => Value::Integer(i64::from(settings.root)),
         "scale" => Value::Integer(i64::from(settings.scale.mask())),
@@ -571,13 +686,13 @@ fn setting_change(name: &str, value: &Value) -> Option<SettingChange> {
     })
 }
 
-/// Convenience helper: apply a [`SettingChange`] to a settings layer.
-pub fn apply_setting(settings: &mut Settings, change: SettingChange) {
+/// Applies a [`SettingChange`] to a settings value.
+pub fn apply_change(settings: &mut Settings, change: &SettingChange) {
     match change {
-        SettingChange::Root(value) => settings.root = Setting::Set(value),
-        SettingChange::Scale(mask) => settings.scale = Setting::Set(Scale::from_mask(mask)),
-        SettingChange::ModalDegree(value) => settings.modal_degree = Setting::Set(value),
-        SettingChange::ScaleAware(value) => settings.scale_aware = Setting::Set(value),
+        SettingChange::Root(value) => settings.root = *value,
+        SettingChange::Scale(mask) => settings.scale = Scale::from_mask(*mask),
+        SettingChange::ModalDegree(value) => settings.modal_degree = *value,
+        SettingChange::ScaleAware(value) => settings.scale_aware = *value,
     }
 }
 
@@ -625,7 +740,7 @@ mod tests {
                 0x40,
                 r#"
                 return { run = function(a1, a2, ctx)
-                    local names = {"os","io","debug","package","require","load","loadfile","dofile","collectgarbage","_G"}
+                    local names = {"os","io","debug","package","load","loadfile","dofile","collectgarbage","_G"}
                     local leaked = 0
                     for _, n in ipairs(names) do
                         if _ENV[n] ~= nil then leaked = leaked + 1 end
@@ -758,7 +873,7 @@ mod tests {
                 r#"
                 return { run = function(a1, a2, ctx)
                     local root = get_setting("root")
-                    set_setting("root", root + 2, "pattern")
+                    set_setting("root", root + 2)
                     emit(0x90, get_setting("root"), 1)
                 end }
                 "#,
@@ -786,5 +901,106 @@ mod tests {
             .unwrap();
         let engine = run(pattern_with_macro(0x47, 0, 0), &runtime);
         assert_eq!(notes(&engine), vec![(0, 0, 1)]);
+    }
+
+    #[test]
+    fn builtin_trigger_and_tempo_modules_work() {
+        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        // Build a parent with a built-in trigger to a child pattern.
+        let mut composition = Composition::new();
+        let child = composition.create_pattern(4).unwrap();
+        {
+            let p = composition.pattern_mut(child).unwrap();
+            p.resize_rows(1).unwrap();
+            p.set_event(
+                0,
+                0,
+                Event::Channel(ChannelMessage::with_data(
+                    ChannelKind::NoteOn,
+                    0,
+                    72,
+                    Some(100),
+                )),
+            );
+        }
+        {
+            let p = composition.pattern_mut(PatternId(0)).unwrap();
+            p.resize_rows(2).unwrap();
+            p.set_event(0, 0, Event::Macro(MacroCall::new(1, child.value(), 0)));
+            p.set_event(1, 0, Event::Macro(MacroCall::new(2, 240, 0)));
+        }
+        let engine = run(composition, &runtime);
+        assert!(notes(&engine).iter().any(|(_, _, key)| *key == 72));
+        assert!(engine
+            .output()
+            .iter()
+            .any(|te| matches!(&te.event, Event::Meta(MetaEvent::Tempo(m)) if *m == 250_000)));
+    }
+
+    #[test]
+    fn require_loads_and_caches_modules_and_detects_cycles() {
+        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        runtime.set_module_source(0x50, "return { value = 7 }");
+        runtime
+            .load_module(
+                0x51,
+                r#"
+                local util = require(0x50)
+                return { run = function(a1, a2, ctx) emit(0x90, util.value, 1) end }
+                "#,
+            )
+            .unwrap();
+        let engine = run(pattern_with_macro(0x51, 0, 0), &runtime);
+        assert_eq!(notes(&engine), vec![(0, 0, 7)]);
+
+        // Circular dependency is a deterministic diagnostic.
+        let cyclic = LuaRuntime::new(LuaLimits::default()).unwrap();
+        cyclic.set_module_source(0x52, "return require(0x53)");
+        cyclic.set_module_source(0x53, "return require(0x52)");
+        let error = cyclic.validate().unwrap_err().to_string();
+        assert!(error.contains("circular"), "{error}");
+    }
+
+    #[test]
+    fn require_reports_unavailable_ids() {
+        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        runtime
+            .load_module(0x54, "return require(0x7E)")
+            .unwrap_err();
+        // The error is raised during module evaluation, so load_module errors.
+        assert!(!runtime.has_module(0x7E));
+    }
+
+    #[test]
+    fn module_zero_setup_side_effects_run_once() {
+        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        runtime
+            .run_setup(
+                r#"
+                register_command("hello")
+                return { greeting = "hi" }
+                "#,
+            )
+            .unwrap();
+        assert_eq!(runtime.commands().len(), 1);
+        let value = runtime.module_value(0).expect("cached");
+        assert!(matches!(value, Value::Table(_)));
+    }
+
+    #[test]
+    fn require_returns_any_cached_value() {
+        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        runtime.set_module_source(0x55, "return 42");
+        runtime
+            .load_module(
+                0x56,
+                r#"
+                local n = require(0x55)
+                return { run = function(a1, a2, ctx) emit(0x90, n, 1) end }
+                "#,
+            )
+            .unwrap();
+        let engine = run(pattern_with_macro(0x56, 0, 0), &runtime);
+        assert_eq!(notes(&engine), vec![(0, 0, 42)]);
     }
 }

@@ -10,7 +10,8 @@ use std::collections::BTreeMap;
 
 use mtrak_core::composition::{Composition, Pattern, PatternId};
 use mtrak_core::event::{ChannelKind, ChannelMessage, Event, MacroCall, MetaEvent};
-use mtrak_core::settings::{Scale, ScaleRegistry, Setting, Settings};
+use mtrak_core::modules::{default_modules, MODULE_TEMPLATE};
+use mtrak_core::settings::{Scale, ScaleRegistry, Settings};
 use mtrak_core::timing::Bpm;
 
 /// Magic prefix shared by metadata chunks and the fallback marker.
@@ -30,15 +31,32 @@ const TAG_SCALES: u8 = 0x03;
 const TAG_PATTERNS: u8 = 0x04;
 const TAG_LUA: u8 = 0x05;
 
-/// A tracker project: the composition plus its Lua macro sources.
+/// A tracker project: the composition plus its Lua module sources.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrackerProject {
     /// The composition itself.
     pub composition: Composition,
-    /// User macro modules (`40`–`7F`) keyed by ID.
-    pub lua_modules: BTreeMap<u8, String>,
-    /// The project setup module (`00`), if any.
-    pub setup_source: Option<String>,
+    /// Authored Lua modules keyed by ID: module `00` plus user modules
+    /// (`40`–`7F`). Built-in modules (`01`–`3F`) are not stored here.
+    pub modules: BTreeMap<u8, String>,
+}
+
+impl TrackerProject {
+    /// A new project around `composition`, containing only the default module
+    /// `00` template.
+    pub fn new(composition: Composition) -> Self {
+        TrackerProject {
+            composition,
+            modules: default_modules(),
+        }
+    }
+
+    /// Ensures module `00` exists, initializing it from the minimal template.
+    pub fn ensure_setup_module(&mut self) {
+        self.modules
+            .entry(0)
+            .or_insert_with(|| MODULE_TEMPLATE.to_string());
+    }
 }
 
 /// Errors from metadata encoding and decoding.
@@ -192,17 +210,10 @@ pub fn encode_project(project: &TrackerProject) -> Vec<u8> {
         }
     });
     section(&mut w, TAG_LUA, |w| {
-        w.u16(project.lua_modules.len() as u16);
-        for (id, source) in &project.lua_modules {
+        w.u16(project.modules.len() as u16);
+        for (id, source) in &project.modules {
             w.u8(*id);
             w.blob(source.as_bytes());
-        }
-        match &project.setup_source {
-            Some(source) => {
-                w.u8(1);
-                w.blob(source.as_bytes());
-            }
-            None => w.u8(0),
         }
     });
     w.into_vec()
@@ -214,11 +225,10 @@ pub fn decode_project(blob: &[u8]) -> Result<TrackerProject, MetadataError> {
     let mut bpm = Bpm::DEFAULT;
     let mut tpb = 24u32;
     let mut selected = PatternId(0);
-    let mut global_settings = Settings::global_default();
+    let mut global_settings = Settings::new();
     let mut registry = ScaleRegistry::new();
     let mut patterns: Vec<Pattern> = Vec::new();
-    let mut lua_modules = BTreeMap::new();
-    let mut setup_source = None;
+    let mut modules: BTreeMap<u8, String> = default_modules();
 
     while !r.is_done() {
         let tag = r.u8()?;
@@ -255,13 +265,7 @@ pub fn decode_project(blob: &[u8]) -> Result<TrackerProject, MetadataError> {
                     let id = s.u8()?;
                     let source = String::from_utf8(s.blob()?.to_vec())
                         .map_err(|_| MetadataError::Invalid("lua source".to_string()))?;
-                    lua_modules.insert(id, source);
-                }
-                if s.u8()? == 1 {
-                    setup_source = Some(
-                        String::from_utf8(s.blob()?.to_vec())
-                            .map_err(|_| MetadataError::Invalid("setup source".to_string()))?,
-                    );
+                    modules.insert(id, source);
                 }
             }
             _ => {
@@ -289,8 +293,7 @@ pub fn decode_project(blob: &[u8]) -> Result<TrackerProject, MetadataError> {
 
     Ok(TrackerProject {
         composition,
-        lua_modules,
-        setup_source,
+        modules,
     })
 }
 
@@ -306,72 +309,18 @@ fn section(w: &mut Writer, tag: u8, body: impl FnOnce(&mut Writer)) {
 }
 
 fn write_settings(w: &mut Writer, settings: &Settings) {
-    write_setting_u8(w, settings.root);
-    write_setting_u16(w, settings.scale.map(Scale::mask));
-    write_setting_u8(w, settings.modal_degree);
-    write_setting_bool(w, settings.scale_aware);
+    w.u8(settings.root);
+    w.u16(settings.scale.mask());
+    w.u8(settings.modal_degree);
+    w.u8(u8::from(settings.scale_aware));
 }
 
 fn read_settings(r: &mut Reader<'_>) -> Result<Settings, MetadataError> {
     Ok(Settings {
-        root: read_setting_u8(r)?,
-        scale: read_setting_u16(r)?.map(Scale::from_mask),
-        modal_degree: read_setting_u8(r)?,
-        scale_aware: read_setting_bool(r)?,
-    })
-}
-
-fn write_setting_u8(w: &mut Writer, setting: Setting<u8>) {
-    match setting {
-        Setting::Inherit => w.u8(0),
-        Setting::Set(value) => {
-            w.u8(1);
-            w.u8(value);
-        }
-    }
-}
-
-fn write_setting_u16(w: &mut Writer, setting: Setting<u16>) {
-    match setting {
-        Setting::Inherit => w.u8(0),
-        Setting::Set(value) => {
-            w.u8(1);
-            w.u16(value);
-        }
-    }
-}
-
-fn write_setting_bool(w: &mut Writer, setting: Setting<bool>) {
-    match setting {
-        Setting::Inherit => w.u8(0),
-        Setting::Set(value) => {
-            w.u8(1);
-            w.u8(u8::from(value));
-        }
-    }
-}
-
-fn read_setting_u8(r: &mut Reader<'_>) -> Result<Setting<u8>, MetadataError> {
-    Ok(if r.u8()? == 1 {
-        Setting::Set(r.u8()?)
-    } else {
-        Setting::Inherit
-    })
-}
-
-fn read_setting_u16(r: &mut Reader<'_>) -> Result<Setting<u16>, MetadataError> {
-    Ok(if r.u8()? == 1 {
-        Setting::Set(r.u16()?)
-    } else {
-        Setting::Inherit
-    })
-}
-
-fn read_setting_bool(r: &mut Reader<'_>) -> Result<Setting<bool>, MetadataError> {
-    Ok(if r.u8()? == 1 {
-        Setting::Set(r.u8()? != 0)
-    } else {
-        Setting::Inherit
+        root: r.u8()?,
+        scale: Scale::from_mask(r.u16()?),
+        modal_degree: r.u8()?,
+        scale_aware: r.u8()? != 0,
     })
 }
 
@@ -387,7 +336,6 @@ fn write_pattern(w: &mut Writer, pattern: &Pattern) {
         }
         None => w.u8(0),
     }
-    write_settings(w, pattern.settings());
     for row in 0..pattern.row_count() {
         for track in 0..pattern.track_count() {
             let slot = pattern.slot(row, track).expect("in-range slot");
@@ -410,10 +358,8 @@ fn read_pattern(r: &mut Reader<'_>) -> Result<Pattern, MetadataError> {
     } else {
         None
     };
-    let settings = read_settings(r)?;
     let mut pattern = Pattern::new(id, lpb, rows, tracks);
     pattern.set_name(name);
-    *pattern.settings_mut() = settings;
     for row in 0..rows {
         for track in 0..tracks {
             let event = read_event(r)?;
@@ -468,8 +414,12 @@ fn write_event(w: &mut Writer, event: &Event) {
             w.u8(call.arg1);
             w.u8(call.arg2);
         }
-        Event::Raw(data) => {
+        Event::SmfEscape(data) => {
             w.u8(5);
+            w.blob(data);
+        }
+        Event::Wire(data) => {
+            w.u8(6);
             w.blob(data);
         }
     }
@@ -504,7 +454,8 @@ fn read_event(r: &mut Reader<'_>) -> Result<Event, MetadataError> {
             let arg2 = r.u8()?;
             Ok(Event::Macro(MacroCall::new(id, arg1, arg2)))
         }
-        5 => Ok(Event::Raw(r.blob()?.to_vec())),
+        5 => Ok(Event::SmfEscape(r.blob()?.to_vec())),
+        6 => Ok(Event::Wire(r.blob()?.to_vec())),
         other => Err(MetadataError::Invalid(format!("event tag {other}"))),
     }
 }
@@ -638,12 +589,12 @@ mod tests {
         composition
             .scales_mut()
             .add("weird", Scale::parse_mask("101001010100").unwrap());
-        let mut lua_modules = BTreeMap::new();
-        lua_modules.insert(0x40, "return { run = function() end }".to_string());
+        let mut modules = default_modules();
+        modules.insert(0x40, "return { run = function() end }".to_string());
+        modules.insert(0, "register_command('x')".to_string());
         TrackerProject {
             composition,
-            lua_modules,
-            setup_source: Some("register_command('x')".to_string()),
+            modules,
         }
     }
 

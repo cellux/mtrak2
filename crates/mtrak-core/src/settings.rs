@@ -1,8 +1,8 @@
-//! Scales, note entry, and live settings inheritance.
+//! Scales, note entry, and composition-global settings.
 //!
-//! Settings are stored as [`Setting`] values so a pattern-local layer can leave
-//! a field as [`Setting::Inherit`] and follow the global layer *live* (decision
-//! D-010) rather than snapshotting it.
+//! Settings are a single concrete layer; the pattern-local inheritance layer
+//! was removed by the remaining-gaps milestone, so there is nothing to resolve
+//! and no `Setting` wrapper.
 
 use std::fmt;
 
@@ -232,104 +232,39 @@ impl ScaleRegistry {
     }
 }
 
-/// A setting that may be inherited from an outer layer.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum Setting<T> {
-    /// Defer to the enclosing layer.
-    #[default]
-    Inherit,
-    /// Use this explicit value.
-    Set(T),
-}
-
-impl<T> Setting<T> {
-    /// Maps the contained value, preserving inheritance.
-    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Setting<U> {
-        match self {
-            Setting::Inherit => Setting::Inherit,
-            Setting::Set(value) => Setting::Set(f(value)),
-        }
-    }
-}
-
-/// A settings layer. The global layer sets every field; a pattern-local layer
-/// starts fully inherited.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Settings {
-    /// Root note as a MIDI note number.
-    pub root: Setting<u8>,
-    /// Selected scale.
-    pub scale: Setting<Scale>,
-    /// Modal degree within the scale.
-    pub modal_degree: Setting<u8>,
-    /// Whether note entry is scale-aware.
-    pub scale_aware: Setting<bool>,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Settings::local()
-    }
-}
-
-impl Settings {
-    /// The local-layer default: everything inherited.
-    pub fn local() -> Self {
-        Settings {
-            root: Setting::Inherit,
-            scale: Setting::Inherit,
-            modal_degree: Setting::Inherit,
-            scale_aware: Setting::Inherit,
-        }
-    }
-
-    /// The global-layer defaults for a new project (see `PLAN.md` §2.10).
-    pub fn global_default() -> Self {
-        Settings {
-            root: Setting::Set(60),
-            scale: Setting::Set(Scale::from_mask(0x0AB5)),
-            modal_degree: Setting::Set(0),
-            scale_aware: Setting::Set(true),
-        }
-    }
-
-    /// Resolves this layer against `outer`, field by field.
-    pub fn resolve(&self, outer: &Settings) -> EffectiveSettings {
-        EffectiveSettings {
-            root: pick(self.root, outer.root).expect("global root must be set"),
-            scale: pick(self.scale, outer.scale).expect("global scale must be set"),
-            modal_degree: pick(self.modal_degree, outer.modal_degree)
-                .expect("global modal degree must be set"),
-            scale_aware: pick(self.scale_aware, outer.scale_aware)
-                .expect("global scale-aware flag must be set"),
-        }
-    }
-}
-
-fn pick<T: Copy>(inner: Setting<T>, outer: Setting<T>) -> Option<T> {
-    match inner {
-        Setting::Set(v) => Some(v),
-        Setting::Inherit => match outer {
-            Setting::Set(v) => Some(v),
-            Setting::Inherit => None,
-        },
-    }
-}
-
-/// A fully resolved settings view.
+/// Composition-global settings used by note entry, display, and macros.
+///
+/// The remaining gaps removed the pattern-local settings layer, so a single
+/// concrete value now describes the whole composition (no inheritance).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct EffectiveSettings {
+pub struct Settings {
     /// Root note as a MIDI note number.
     pub root: u8,
     /// Selected scale.
     pub scale: Scale,
-    /// Modal degree.
+    /// Modal degree within the scale.
     pub modal_degree: u8,
     /// Whether note entry is scale-aware.
     pub scale_aware: bool,
 }
 
-impl EffectiveSettings {
+impl Default for Settings {
+    fn default() -> Self {
+        Settings::new()
+    }
+}
+
+impl Settings {
+    /// The defaults for a new project (see `PLAN.md` §2.10).
+    pub fn new() -> Self {
+        Settings {
+            root: 60,
+            scale: Scale::from_mask(0x0AB5),
+            modal_degree: 0,
+            scale_aware: true,
+        }
+    }
+
     /// Converts a note-entry degree to a MIDI note, clamped to `0..=127`.
     ///
     /// In scale-aware mode the degree indexes the (modal) scale; in chromatic
@@ -350,6 +285,10 @@ impl EffectiveSettings {
         clamp_note(self.root as i32 + offset)
     }
 }
+
+/// A fully resolved settings view. Retained as an alias because settings are
+/// global-only now; there is no separate local layer to resolve.
+pub type EffectiveSettings = Settings;
 
 fn clamp_note(note: i32) -> u8 {
     note.clamp(0, 127) as u8
@@ -454,56 +393,42 @@ mod tests {
 
     #[test]
     fn degree_to_note_in_scale_and_chromatic_modes() {
-        let global = Settings::global_default();
-        let local = Settings::local();
-        let effective = local.resolve(&global);
+        let settings = Settings::new();
         // C major, scale-aware: degrees 0..7 -> C D E F G A B C
-        assert_eq!(effective.degree_to_note(0), 60);
-        assert_eq!(effective.degree_to_note(1), 62);
-        assert_eq!(effective.degree_to_note(2), 64);
-        assert_eq!(effective.degree_to_note(3), 65);
-        assert_eq!(effective.degree_to_note(6), 71);
-        assert_eq!(effective.degree_to_note(7), 72);
+        assert_eq!(settings.degree_to_note(0), 60);
+        assert_eq!(settings.degree_to_note(1), 62);
+        assert_eq!(settings.degree_to_note(2), 64);
+        assert_eq!(settings.degree_to_note(3), 65);
+        assert_eq!(settings.degree_to_note(6), 71);
+        assert_eq!(settings.degree_to_note(7), 72);
 
         let chromatic = Settings {
-            scale_aware: Setting::Set(false),
-            ..Settings::global_default()
+            scale_aware: false,
+            ..Settings::new()
         };
-        let effective = Settings::local().resolve(&chromatic);
-        assert_eq!(effective.degree_to_note(0), 60);
-        assert_eq!(effective.degree_to_note(4), 64);
-        assert_eq!(effective.degree_to_note(127), 127);
+        assert_eq!(chromatic.degree_to_note(0), 60);
+        assert_eq!(chromatic.degree_to_note(4), 64);
+        assert_eq!(chromatic.degree_to_note(127), 127);
     }
 
     #[test]
     fn degree_to_note_clamps_at_127() {
         let settings = Settings {
-            root: Setting::Set(120),
-            scale_aware: Setting::Set(false),
-            ..Settings::global_default()
+            root: 120,
+            scale_aware: false,
+            ..Settings::new()
         };
-        let effective = Settings::local().resolve(&settings);
-        assert_eq!(effective.degree_to_note(100), 127);
+        assert_eq!(settings.degree_to_note(100), 127);
     }
 
     #[test]
-    fn settings_resolution_shadows_and_inherits_live() {
-        let global = Settings::global_default();
-        let mut local = Settings::local();
-        assert_eq!(local.resolve(&global).root, 60);
-        local.root = Setting::Set(48);
-        assert_eq!(local.resolve(&global).root, 48);
-        // A live global change is visible through fields the local layer inherits.
-        let moved = Settings {
-            root: Setting::Set(67),
-            ..Settings::global_default()
-        };
-        assert_eq!(local.resolve(&moved).root, 48);
-        let malo = Settings {
-            modal_degree: Setting::Set(5),
-            ..global.clone()
-        };
-        assert_eq!(local.resolve(&malo).modal_degree, 5);
+    fn settings_are_a_single_concrete_layer() {
+        let mut settings = Settings::new();
+        assert_eq!(settings.root, 60);
+        settings.root = 48;
+        assert_eq!(settings.degree_to_note(0), 48);
+        settings.modal_degree = 5;
+        assert_eq!(settings.modal_degree, 5);
     }
 
     #[test]

@@ -70,7 +70,7 @@ pub fn render_events(
 fn encodable(event: &Event) -> bool {
     matches!(
         event,
-        Event::Channel(_) | Event::SysEx(_) | Event::Meta(_) | Event::Raw(_)
+        Event::Channel(_) | Event::SysEx(_) | Event::Meta(_) | Event::SmfEscape(_) | Event::Wire(_)
     )
 }
 
@@ -108,9 +108,9 @@ pub fn write_smf(ppq: u16, tracks: &[Vec<(Ticks, Event)>]) -> Result<Vec<u8>, Sm
             let delta = u32::try_from(delta)
                 .map_err(|_| SmfError::Invalid("delta-time overflow".to_string()))?;
             mtrak_core::codec::write_vlq(delta, &mut body);
-            let bytes = event
-                .to_smf_bytes()
-                .map_err(|e| SmfError::Encode(e.to_string()))?;
+            let bytes = event.to_smf_bytes().map_err(|e| {
+                SmfError::Encode(format!("event at tick {tick} is not representable: {e}"))
+            })?;
             body.extend_from_slice(&bytes);
             last = *tick;
         }
@@ -155,8 +155,58 @@ pub fn export_standard(
     write_smf(ppq, &[track])
 }
 
+/// Validates the SMF container framing before parsing.
+///
+/// Import is strict: a malformed header or track framing rejects the whole
+/// file rather than partially importing it.
+fn validate_container(bytes: &[u8]) -> Result<(), SmfError> {
+    if bytes.len() < 14 || &bytes[0..4] != b"MThd" {
+        return Err(SmfError::Invalid("missing MThd header".to_string()));
+    }
+    let header_len = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    if header_len != 6 {
+        return Err(SmfError::Invalid(format!(
+            "MThd length {header_len} is not 6"
+        )));
+    }
+    let format = u16::from_be_bytes([bytes[8], bytes[9]]);
+    if format > 2 {
+        return Err(SmfError::Invalid(format!(
+            "unsupported SMF format {format}"
+        )));
+    }
+    let tracks = u16::from_be_bytes([bytes[10], bytes[11]]);
+    let mut pos = 8 + header_len as usize;
+    for track in 0..tracks {
+        if pos + 8 > bytes.len() {
+            return Err(SmfError::Invalid(format!(
+                "track {track} header is truncated"
+            )));
+        }
+        if &bytes[pos..pos + 4] != b"MTrk" {
+            return Err(SmfError::Invalid(format!(
+                "track {track} is missing its MTrk header"
+            )));
+        }
+        let len = u32::from_be_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
+        if pos + 8 + len > bytes.len() {
+            return Err(SmfError::Invalid(format!(
+                "track {track} body is truncated"
+            )));
+        }
+        pos += 8 + len;
+    }
+    Ok(())
+}
+
 /// Loads a `.mid` file, detecting tracker metadata automatically.
 pub fn load(bytes: &[u8]) -> Result<LoadedFile, SmfError> {
+    validate_container(bytes)?;
     let smf = Smf::parse(bytes).map_err(|e| SmfError::Parse(e.to_string()))?;
     let mut chunks: Vec<MetadataChunk> = Vec::new();
     for track in &smf.tracks {
@@ -201,7 +251,9 @@ pub fn import_standard(smf: &Smf<'_>) -> Result<TrackerProject, SmfError> {
                     events.push((tick, channel_from_midi(*channel, *message)));
                 }
                 TrackEventKind::SysEx(data) => events.push((tick, Event::SysEx(data.to_vec()))),
-                TrackEventKind::Escape(data) => events.push((tick, Event::Raw(data.to_vec()))),
+                TrackEventKind::Escape(data) => {
+                    events.push((tick, Event::SmfEscape(data.to_vec())))
+                }
                 TrackEventKind::Meta(meta) => {
                     if let Some(event) = meta_from_midly(meta) {
                         if initial_tempo.is_none() {
@@ -272,11 +324,7 @@ pub fn import_standard(smf: &Smf<'_>) -> Result<TrackerProject, SmfError> {
         .map_err(|e| SmfError::Composition(e.to_string()))?;
     composition.set_selected_main_raw(PatternId(0));
 
-    Ok(TrackerProject {
-        composition,
-        lua_modules: Default::default(),
-        setup_source: None,
-    })
+    Ok(TrackerProject::new(composition))
 }
 
 fn choose_tick_len(tpb: u32, max_tick: Ticks) -> u32 {
@@ -460,11 +508,7 @@ mod tests {
                 })),
             );
         }
-        TrackerProject {
-            composition,
-            lua_modules: Default::default(),
-            setup_source: None,
-        }
+        TrackerProject::new(composition)
     }
 
     #[test]
@@ -580,6 +624,40 @@ mod tests {
         assert_eq!(ticks, expected);
         assert_eq!(composition.pattern(PatternId(0)).unwrap().lpb(), 24);
         assert_eq!(composition.pattern(PatternId(0)).unwrap().track_count(), 2);
+    }
+
+    #[test]
+    fn strict_import_rejects_malformed_containers() {
+        // Missing MThd.
+        assert!(load(b"not a midi file").is_err());
+        // Truncated track body.
+        let mut good = write_smf(24, &[vec![(0, note(60, 0))]]).unwrap();
+        good.truncate(good.len() - 2);
+        assert!(load(&good).is_err());
+        // Bad header length.
+        let mut bad_header = write_smf(24, &[vec![(0, note(60, 0))]]).unwrap();
+        bad_header[7] = 8;
+        assert!(load(&bad_header).is_err());
+    }
+
+    #[test]
+    fn wire_events_without_a_file_representation_fail_loudly() {
+        let track = vec![(0u64, Event::Wire(vec![0xF8]))];
+        let error = write_smf(24, &[track]).unwrap_err().to_string();
+        assert!(error.contains("tick 0"), "{error}");
+        assert!(error.contains("not representable"), "{error}");
+    }
+
+    #[test]
+    fn smf_escape_events_are_preserved_on_import() {
+        let escape = Event::SmfEscape(vec![0x01, 0x02]);
+        let bytes = write_smf(24, &[vec![(0, escape.clone())]]).unwrap();
+        let loaded = load(&bytes).unwrap();
+        let restored = loaded.project.composition.pattern(PatternId(0)).unwrap();
+        let found = restored
+            .iter_slots()
+            .any(|(_, _, slot)| slot.event == escape);
+        assert!(found, "the Escape event must survive import");
     }
 
     #[test]

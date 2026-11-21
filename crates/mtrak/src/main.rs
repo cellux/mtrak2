@@ -29,16 +29,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut last_revision = app.project_revision();
-    let result = mtrak_tui::ui::run_with(&mut app, |app| {
-        if app.project_revision() == last_revision {
-            return;
-        }
-        last_revision = app.project_revision();
-        resync_project(app);
-    });
-
-    match result {
+    match mtrak_tui::ui::run(&mut app) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("mtrak: {error}");
@@ -55,11 +46,7 @@ fn build_app(path: Option<String>) -> Result<App, String> {
             (loaded.project, Some(std::path::PathBuf::from(path)))
         }
         None => (
-            mtrak_midi_io::TrackerProject {
-                composition: mtrak_core::composition::Composition::new(),
-                lua_modules: Default::default(),
-                setup_source: None,
-            },
+            mtrak_midi_io::TrackerProject::new(mtrak_core::composition::Composition::new()),
             None,
         ),
     };
@@ -77,7 +64,6 @@ fn build_app(path: Option<String>) -> Result<App, String> {
     }
     app.set_midi(manager);
 
-    #[cfg(feature = "lua")]
     if let Some((source, commands)) = lua_support::LuaSource::build(app.project()) {
         app.set_lua_commands(commands);
         app.set_macro_source(Box::new(source));
@@ -99,22 +85,10 @@ fn make_backend() -> Box<dyn MidiBackend> {
     Box::new(mtrak_midi::MockBackend::new(&[]))
 }
 
-#[cfg(feature = "lua")]
-fn resync_project(app: &mut App) {
-    match lua_support::LuaSource::build(app.project()) {
-        Some((source, commands)) => {
-            app.set_lua_commands(commands);
-            app.set_macro_source(Box::new(source));
-        }
-        None => app.set_lua_commands(Vec::new()),
-    }
-}
-
-#[cfg(not(feature = "lua"))]
-fn resync_project(_app: &mut App) {}
-
-#[cfg(feature = "lua")]
 mod lua_support {
+    use std::collections::BTreeMap;
+
+    use mtrak_core::modules::SETUP;
     use mtrak_engine::lua::{LuaLimits, LuaMacroFactory, LuaRuntime};
     use mtrak_engine::macros::MacroFactory;
     use mtrak_midi_io::TrackerProject;
@@ -129,13 +103,30 @@ mod lua_support {
         /// Builds a runtime from the project's Lua sources, returning the source
         /// and the project-defined commands it registered.
         pub fn build(project: &TrackerProject) -> Option<(LuaSource, Vec<LuaCommand>)> {
-            let runtime = LuaRuntime::new(LuaLimits::default()).ok()?;
-            if let Some(setup) = &project.setup_source {
-                let _ = runtime.run_setup(setup);
+            let mut source = LuaSource {
+                runtime: LuaRuntime::new(LuaLimits::default()).ok()?,
+            };
+            let commands = source.reload(&project.modules).ok()?;
+            Some((source, commands))
+        }
+    }
+
+    impl MacroSource for LuaSource {
+        fn factory(&self) -> Option<Box<dyn MacroFactory>> {
+            Some(Box::new(LuaMacroFactory::new(self.runtime.clone())))
+        }
+
+        fn reload(&mut self, modules: &BTreeMap<u8, String>) -> Result<Vec<LuaCommand>, String> {
+            let runtime = LuaRuntime::new(LuaLimits::default()).map_err(|e| e.to_string())?;
+            if let Some(source) = modules.get(&SETUP) {
+                runtime.run_setup(source).map_err(|e| e.to_string())?;
             }
-            for (id, source) in &project.lua_modules {
-                let _ = runtime.load_module(*id, source);
+            for (id, source) in modules {
+                if *id != SETUP {
+                    runtime.set_module_source(*id, source);
+                }
             }
+            runtime.validate().map_err(|e| e.to_string())?;
             let commands = runtime
                 .commands()
                 .into_iter()
@@ -144,13 +135,8 @@ mod lua_support {
                     description: command.description,
                 })
                 .collect();
-            Some((LuaSource { runtime }, commands))
-        }
-    }
-
-    impl MacroSource for LuaSource {
-        fn factory(&self) -> Option<Box<dyn MacroFactory>> {
-            Some(Box::new(LuaMacroFactory::new(self.runtime.clone())))
+            self.runtime = runtime;
+            Ok(commands)
         }
     }
 }

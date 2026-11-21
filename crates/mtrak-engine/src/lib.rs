@@ -7,7 +7,6 @@
 
 #![forbid(unsafe_code)]
 
-#[cfg(feature = "lua")]
 pub mod lua;
 pub mod macros;
 pub mod scheduler;

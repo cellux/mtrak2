@@ -7,15 +7,19 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod chooser;
 pub mod clipboard;
+pub mod code;
 pub mod command;
-pub mod editor;
+pub mod edit;
 pub mod key;
+pub mod line;
 pub mod ui;
 pub mod undo;
 
 pub use app::{
-    App, BrushHeight, BrushWidth, LuaCommand, MacroSource, Message, Mode, Rect, Selection,
+    App, BrushHeight, BrushWidth, ChooserClipboard, LuaCommand, MacroSource, Message, Mode, Rect,
+    Screen, Selection,
 };
 pub use command::{parse as parse_command, Command};
 pub use key::{Action, Code, Key};

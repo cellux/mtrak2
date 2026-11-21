@@ -14,13 +14,15 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect as Area};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
-use crate::app::{App, Mode};
+use crate::app::{App, Mode, Screen};
+use crate::chooser::ChooserKind;
+use crate::code::{highlight, TokenKind};
 use crate::key::{Code, Key};
 
 /// Runs the interactive application until the user quits.
@@ -28,8 +30,7 @@ pub fn run(app: &mut App) -> io::Result<()> {
     run_with(app, |_| {})
 }
 
-/// Runs the application, calling `on_tick` once per frame for side effects such
-/// as re-syncing a project's Lua sources after a reload.
+/// Runs the application, calling `on_tick` once per frame for side effects.
 pub fn run_with(app: &mut App, mut on_tick: impl FnMut(&mut App)) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -90,6 +91,7 @@ fn convert_key(key: KeyEvent) -> Option<Key> {
         KeyCode::Home => Code::Home,
         KeyCode::End => Code::End,
         KeyCode::Tab | KeyCode::BackTab => Code::Tab,
+        KeyCode::F(n) => Code::Function(n),
         _ => return None,
     };
     let back_tab = matches!(key.code, KeyCode::BackTab);
@@ -112,36 +114,60 @@ fn draw(frame: &mut Frame, app: &App) {
         ])
         .split(area);
     draw_header(frame, app, chunks[0]);
-    draw_grid(frame, app, chunks[1]);
+    match app.screen() {
+        Screen::Help => draw_help(frame, chunks[1]),
+        Screen::Pattern => draw_pattern(frame, app, chunks[1]),
+        Screen::Code => draw_code(frame, app, chunks[1]),
+    }
+    if app.mode() == Mode::Chooser {
+        draw_chooser(frame, app, area);
+    }
     draw_status(frame, app, chunks[2]);
 }
 
-fn draw_header(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+fn draw_header(frame: &mut Frame, app: &App, area: Area) {
     let composition = &app.project().composition;
-    let settings = app.effective_settings();
     let note_mode = match app.mode() {
-        Mode::Normal => "scal",
         Mode::Note if app.note_chromatic() => "chrom",
         Mode::Note => "scal",
         Mode::Command => "cmd",
-        Mode::EventEditor => "evt",
+        Mode::Chooser => "choose",
+        Mode::Normal => "scal",
+    };
+    let screen = match app.screen() {
+        Screen::Help => "HELP".to_string(),
+        Screen::Pattern => format!("PAT {:02X}", app.current_pattern().value()),
+        Screen::Code => format!("MOD {:02X}", app.module_id()),
     };
     let line = Line::from(vec![
         Span::styled(" mtrak ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(format!(
-            " BPM {}  TPB {}  LPB {}  PAT {}  ROOT {}  NOTE {} ",
+            " BPM {}  TPB {}  {}  ROOT {}  NOTE {} ",
             composition.bpm(),
             composition.tpb(),
-            app.pattern().lpb(),
-            app.current_pattern(),
-            mtrak_core::settings::format_note(settings.root),
+            screen,
+            mtrak_core::settings::format_note(app.effective_settings().root),
             note_mode,
         )),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_grid(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+fn draw_help(frame: &mut Frame, area: Area) {
+    let block = Block::default().borders(Borders::ALL).title(" help ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let text = vec![
+        Line::raw("F1 help   F2 pattern   F3 code"),
+        Line::raw(""),
+        Line::raw("Pattern: arrows move  hex types  enter edits  ctrl-enter choose"),
+        Line::raw("         o offsets  space play  : command  ctrl-n note  ctrl-s save"),
+        Line::raw("Code:    ctrl-enter choose module  F5 reload  ctrl-z undo"),
+    ];
+    frame.render_widget(Paragraph::new(text), inner);
+}
+
+fn draw_pattern(frame: &mut Frame, app: &App, area: Area) {
     let title = format!(" pattern {:02X} ", app.current_pattern().value());
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
@@ -154,17 +180,24 @@ fn draw_grid(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let rows = pattern.row_count();
     let tracks = pattern.track_count();
     let lpb = pattern.lpb() as usize;
+    let offsets = app.offsets_visible();
+    let cell_w = if offsets { 12 } else { 7 };
     let label_w = 5usize;
-    let cell_w = 7usize;
     let visible_tracks = (((inner.width as usize).saturating_sub(label_w)) / cell_w)
         .max(1)
         .min(tracks);
     let visible_rows = (inner.height as usize).saturating_sub(1).max(1);
-    let row_off = scroll_offset(app.row, rows, visible_rows);
-    let track_off = scroll_offset(app.track, tracks, visible_tracks);
+    let (cursor_row, cursor_track, cursor_nibble) = app.cursor();
+    let row_off = scroll_offset(cursor_row, rows, visible_rows);
+    let track_off = scroll_offset(cursor_track, tracks, visible_tracks);
     let selection = app.selection().map(|s| s.rect());
     let affected = app.affected_rect();
     let note_mode = app.mode() == Mode::Note;
+    let cursor_char = if cursor_nibble < 6 {
+        cursor_nibble
+    } else {
+        cursor_nibble + 1
+    };
 
     let mut lines: Vec<Line> = Vec::new();
     let mut header = vec![Span::styled(
@@ -187,71 +220,273 @@ fn draw_grid(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         };
         let mut spans = vec![Span::styled(format!("{row:04X} "), row_style)];
         for track in track_off..(track_off + visible_tracks).min(tracks) {
-            let text = app.cell_text(row, track);
-            let mut style = Style::default();
+            let text = app.cell_display(row, track);
             let in_selection = selection
-                .map(|s| row >= s.top && row <= s.bottom && track >= s.left && track <= s.right)
+                .map(|s| {
+                    row >= s.top && row <= s.bottom && {
+                        let (lt, rt) = (
+                            s.left / app.nibbles_per_cell(),
+                            s.right / app.nibbles_per_cell(),
+                        );
+                        track >= lt && track <= rt
+                    }
+                })
                 .unwrap_or(false);
-            if in_selection {
-                style = style.bg(Color::Rgb(0, 40, 90));
-            } else if row >= affected.top
-                && row <= affected.bottom
-                && track >= affected.left
-                && track <= affected.right
-            {
-                style = style.bg(Color::Rgb(0, 24, 48));
+            let in_affected = {
+                let (lt, rt) = affected.tracks(app.nibbles_per_cell());
+                row >= affected.top && row <= affected.bottom && track >= lt && track <= rt
+            };
+            let base = if in_selection {
+                Style::default().bg(Color::Rgb(0, 40, 90))
+            } else if in_affected {
+                Style::default().bg(Color::Rgb(0, 24, 48))
+            } else {
+                Style::default()
+            };
+            let invalid_offset =
+                offsets && row == cursor_row && track == cursor_track && app.offset_invalid();
+            for (i, ch) in text.chars().enumerate() {
+                let mut style = base;
+                if invalid_offset && i > 6 {
+                    style = style.fg(Color::Red);
+                }
+                if row == cursor_row && track == cursor_track && i == cursor_char {
+                    let cursor_bg = if note_mode {
+                        Color::Magenta
+                    } else {
+                        Color::Blue
+                    };
+                    style = style
+                        .bg(cursor_bg)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD);
+                } else if app.is_playing() && row == app.play_row() {
+                    style = style.fg(Color::Green).add_modifier(Modifier::BOLD);
+                }
+                spans.push(Span::styled(ch.to_string(), style));
             }
-            if row == app.row && track == app.track {
-                let cursor_bg = if note_mode {
-                    Color::Magenta
-                } else {
-                    Color::Blue
-                };
-                style = style
-                    .bg(cursor_bg)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD);
-            }
-            if app.is_playing() && row == app.play_row() {
-                style = style.fg(Color::Green).add_modifier(Modifier::BOLD);
-            }
-            spans.push(Span::styled(format!("{text} "), style));
+            spans.push(Span::raw(" "));
         }
         lines.push(Line::from(spans));
     }
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_status(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let line = match app.mode() {
-        Mode::Command => Line::from(vec![
-            Span::styled(":", Style::default().fg(Color::Yellow)),
-            Span::raw(app.input().to_string()),
-        ]),
-        Mode::EventEditor => Line::from(vec![
-            Span::styled("event ", Style::default().fg(Color::Magenta)),
-            Span::raw(app.input().to_string()),
-            Span::styled(
-                "   [enter commit, esc cancel]",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-        _ => match app.message() {
-            Some(message) if message.is_error => Line::from(Span::styled(
-                message.text.clone(),
-                Style::default().fg(Color::Red),
-            )),
-            Some(message) => Line::from(Span::styled(
-                message.text.clone(),
-                Style::default().fg(Color::Green),
-            )),
-            None => Line::from(Span::styled(
-                "space play  s start  : command  ctrl-n note  ctrl-s save  ctrl-q quit",
-                Style::default().fg(Color::DarkGray),
-            )),
-        },
+fn draw_code(frame: &mut Frame, app: &App, area: Area) {
+    let readonly = app.module_readonly(app.module_id());
+    let title = format!(
+        " module {:02X}{} ",
+        app.module_id(),
+        if readonly { " (built-in)" } else { "" }
+    );
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width < 4 || inner.height < 1 {
+        return;
+    }
+    let editor = app.code_editor();
+    let (cursor_line, cursor_col) = editor.cursor();
+    let visible = inner.height as usize;
+    let scroll = viewport_scroll(app.code_scroll(), cursor_line, editor.line_count(), visible);
+    let mut lines: Vec<Line> = Vec::new();
+    for line_index in scroll..(scroll + visible).min(editor.line_count()) {
+        let chars = editor.line(line_index);
+        let spans = highlight_line(chars);
+        let mut rendered = vec![Span::styled(
+            format!("{:>4} ", line_index + 1),
+            Style::default().fg(Color::DarkGray),
+        )];
+        if line_index == cursor_line {
+            rendered.extend(cursor_spans(&spans, chars, cursor_col));
+        } else {
+            rendered.extend(spans);
+        }
+        lines.push(Line::from(rendered));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn highlight_line(chars: &[char]) -> Vec<Span<'static>> {
+    let spans = highlight(chars);
+    let mut rendered = Vec::new();
+    let mut cursor = 0;
+    for span in spans {
+        if span.start > cursor {
+            let text: String = chars[cursor..span.start].iter().collect();
+            rendered.push(Span::raw(text));
+        }
+        let text: String = chars[span.start..span.end.min(chars.len())]
+            .iter()
+            .collect();
+        rendered.push(Span::styled(text, token_style(span.kind)));
+        cursor = span.end;
+    }
+    if cursor < chars.len() {
+        let text: String = chars[cursor..].iter().collect();
+        rendered.push(Span::raw(text));
+    }
+    rendered
+}
+
+fn cursor_spans(spans: &[Span<'static>], chars: &[char], cursor_col: usize) -> Vec<Span<'static>> {
+    let _ = spans;
+    chars
+        .iter()
+        .enumerate()
+        .map(|(i, ch)| {
+            let style = if i == cursor_col {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::default()
+            };
+            Span::styled(ch.to_string(), style)
+        })
+        .collect()
+}
+
+fn token_style(kind: TokenKind) -> Style {
+    match kind {
+        TokenKind::Keyword => Style::default().fg(Color::Magenta),
+        TokenKind::Function => Style::default().fg(Color::Cyan),
+        TokenKind::Number => Style::default().fg(Color::Yellow),
+        TokenKind::String => Style::default().fg(Color::Green),
+        TokenKind::Comment => Style::default().fg(Color::DarkGray),
+        TokenKind::Punctuation => Style::default().fg(Color::Gray),
+    }
+}
+
+fn draw_chooser(frame: &mut Frame, app: &App, area: Area) {
+    let Some(chooser) = app.chooser() else {
+        return;
+    };
+    let width = 16 * 3 + 2;
+    let height = 16 + 2;
+    let popup = centered(area, width, height);
+    frame.render_widget(Clear, popup);
+    let title = match chooser.kind {
+        ChooserKind::Pattern => " patterns ",
+        ChooserKind::Code => " modules ",
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut lines = Vec::new();
+    for row in 0..16u8 {
+        let mut spans = Vec::new();
+        for col in 0..16u8 {
+            let id = row * 16 + col;
+            let (label, style) = chooser_cell(app, chooser.kind, id);
+            let mut style = style;
+            if id == chooser.cursor {
+                style = style
+                    .bg(Color::Blue)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD);
+            }
+            spans.push(Span::styled(label, style));
+            spans.push(Span::raw(" "));
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn chooser_cell(app: &App, kind: ChooserKind, id: u8) -> (String, Style) {
+    match kind {
+        ChooserKind::Pattern => {
+            if app.pattern_exists(id) {
+                (format!("{id:02X}"), Style::default().fg(Color::Green))
+            } else {
+                ("..".to_string(), Style::default().fg(Color::DarkGray))
+            }
+        }
+        ChooserKind::Code => {
+            let style = if id == 0 {
+                Style::default().fg(Color::Green)
+            } else if app.module_readonly(id) {
+                Style::default().fg(Color::Yellow)
+            } else if id >= 0x80 {
+                Style::default().fg(Color::Red)
+            } else if app.module_available(id) {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let label = if app.module_source(id).is_some() {
+                format!("{id:02X}")
+            } else {
+                "..".to_string()
+            };
+            (label, style)
+        }
+    }
+}
+
+fn draw_status(frame: &mut Frame, app: &App, area: Area) {
+    if app.mode() == Mode::Command {
+        let style = if app.command_failed() {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        let text = app.input_text();
+        let cursor = app.input_cursor();
+        let mut spans = vec![Span::styled(":", style)];
+        for (i, ch) in text.chars().enumerate() {
+            let mut char_style = style;
+            if i == cursor {
+                char_style = char_style.add_modifier(Modifier::REVERSED);
+            }
+            spans.push(Span::styled(ch.to_string(), char_style));
+        }
+        if cursor >= text.chars().count() {
+            spans.push(Span::styled(" ", style.add_modifier(Modifier::REVERSED)));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
+    if app.mode() == Mode::Chooser {
+        let line = Line::from(Span::styled(
+            "arrows move  hex jumps  enter accept  esc cancel  ctrl-c/x/v copy/cut/paste",
+            Style::default().fg(Color::DarkGray),
+        ));
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    let line = match app.message() {
+        Some(message) if message.is_error => Line::from(Span::styled(
+            message.text.clone(),
+            Style::default().fg(Color::Red),
+        )),
+        Some(message) => Line::from(Span::styled(
+            message.text.clone(),
+            Style::default().fg(Color::Green),
+        )),
+        None => {
+            let hint = match app.screen() {
+                Screen::Help => "F2 pattern  F3 code  ctrl-q quit",
+                Screen::Pattern => {
+                    "space play  s start  : command  enter edit  ctrl-enter choose  ctrl-s save"
+                }
+                Screen::Code => "ctrl-enter choose module  F5 reload  ctrl-z undo  ctrl-s save",
+            };
+            Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))
+        }
     };
     frame.render_widget(Paragraph::new(line), area);
+}
+
+fn centered(area: Area, width: u16, height: u16) -> Area {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Area {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
 }
 
 fn scroll_offset(cursor: usize, total: usize, visible: usize) -> usize {
@@ -265,5 +500,19 @@ fn scroll_offset(cursor: usize, total: usize, visible: usize) -> usize {
         total - visible
     } else {
         cursor - half
+    }
+}
+
+fn viewport_scroll(current: usize, cursor: usize, total: usize, visible: usize) -> usize {
+    if total <= visible {
+        return 0;
+    }
+    let max = total - visible;
+    if cursor < current {
+        cursor
+    } else if cursor >= current + visible {
+        (cursor + 1 - visible).min(max)
+    } else {
+        current.min(max)
     }
 }

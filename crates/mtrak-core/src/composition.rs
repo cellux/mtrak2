@@ -72,7 +72,6 @@ pub struct Pattern {
     id: PatternId,
     name: Option<String>,
     lpb: u32,
-    settings: Settings,
     rows: Vec<Vec<Slot>>,
 }
 
@@ -85,7 +84,6 @@ impl Pattern {
             id,
             name: None,
             lpb,
-            settings: Settings::local(),
             rows: vec![vec![Slot::empty(); tracks]; rows],
         }
     }
@@ -93,6 +91,15 @@ impl Pattern {
     /// The stable pattern ID.
     pub fn id(&self) -> PatternId {
         self.id
+    }
+
+    /// Returns a copy of this pattern under a different stable ID.
+    ///
+    /// Used by chooser paste, which preserves the destination ID.
+    pub fn with_id(&self, id: PatternId) -> Pattern {
+        let mut clone = self.clone();
+        clone.id = id;
+        clone
     }
 
     /// The optional pattern name.
@@ -113,16 +120,6 @@ impl Pattern {
     /// Mutable access to lines per beat. The caller must keep TPB divisible.
     pub(crate) fn set_lpb_unchecked(&mut self, lpb: u32) {
         self.lpb = lpb;
-    }
-
-    /// The pattern-local settings layer.
-    pub fn settings(&self) -> &Settings {
-        &self.settings
-    }
-
-    /// Mutable access to the pattern-local settings layer.
-    pub fn settings_mut(&mut self) -> &mut Settings {
-        &mut self.settings
     }
 
     /// The number of rows.
@@ -263,7 +260,7 @@ impl Composition {
         Composition {
             bpm: Bpm::DEFAULT,
             tpb: DEFAULT_TPB,
-            global_settings: Settings::global_default(),
+            global_settings: Settings::new(),
             scales: ScaleRegistry::new(),
             patterns,
             selected_main: PatternId(0),
@@ -277,7 +274,7 @@ impl Composition {
         Composition {
             bpm: Bpm::DEFAULT,
             tpb: DEFAULT_TPB,
-            global_settings: Settings::global_default(),
+            global_settings: Settings::new(),
             scales: ScaleRegistry::new(),
             patterns,
             selected_main: PatternId(0),
@@ -414,6 +411,32 @@ impl Composition {
         Ok(id)
     }
 
+    /// Creates a pattern with the given LPB at a specific stable ID.
+    ///
+    /// This backs the pattern chooser: selecting an empty cell creates it with
+    /// the existing defaults (LPB 4, 64 rows, 16 tracks).
+    pub fn create_pattern_at(&mut self, id: PatternId, lpb: u32) -> Result<(), CompositionError> {
+        if lpb == 0 {
+            return Err(CompositionError::Timing(TimingError::ZeroLpb));
+        }
+        if self.pattern(id).is_some() {
+            return Err(CompositionError::PatternSlotOccupied(id));
+        }
+        self.ensure_tpb_for_lpb(lpb)?;
+        self.patterns[id.0 as usize] = Some(Pattern::new(id, lpb, DEFAULT_ROWS, DEFAULT_TRACKS));
+        Ok(())
+    }
+
+    /// Places or replaces a fully-built pattern at its own ID.
+    ///
+    /// Used by chooser paste, which preserves the destination ID.
+    pub fn replace_pattern(&mut self, pattern: Pattern) -> Result<(), CompositionError> {
+        let id = pattern.id();
+        self.ensure_tpb_for_lpb(pattern.lpb())?;
+        self.patterns[id.0 as usize] = Some(pattern);
+        Ok(())
+    }
+
     /// Deletes a pattern, leaving its ID unused. The main pattern cannot be
     /// deleted.
     pub fn delete_pattern(&mut self, id: PatternId) -> Result<(), CompositionError> {
@@ -490,10 +513,12 @@ impl Composition {
         Ok(())
     }
 
-    /// Resolves a pattern's effective settings against the global layer.
+    /// The composition-global settings, for any existing pattern.
+    ///
+    /// Settings are global-only now, so this ignores `id` except to reject
+    /// patterns that do not exist.
     pub fn effective_settings(&self, id: PatternId) -> Option<crate::settings::EffectiveSettings> {
-        self.pattern(id)
-            .map(|p| p.settings().resolve(&self.global_settings))
+        self.pattern(id).map(|_| self.global_settings)
     }
 }
 
@@ -512,7 +537,6 @@ pub const DEFAULT_TPB: u32 = 24;
 mod tests {
     use super::*;
     use crate::event::ChannelKind;
-    use crate::settings::Setting;
 
     #[test]
     fn new_project_matches_spec_defaults() {
@@ -648,30 +672,13 @@ mod tests {
     }
 
     #[test]
-    fn local_settings_shadow_global_live() {
+    fn settings_are_global_only() {
         let mut comp = Composition::new();
         let id = comp.create_pattern(4).unwrap();
         assert_eq!(comp.effective_settings(id).unwrap().root, 60);
-        comp.pattern_mut(id).unwrap().settings_mut().root = Setting::Set(48);
-        assert_eq!(comp.effective_settings(id).unwrap().root, 48);
-        // The local override still shadows a live global change.
-        comp.global_settings_mut().root = Setting::Set(67);
-        assert_eq!(comp.effective_settings(id).unwrap().root, 48);
-        // But an inheriting field follows it.
+        comp.global_settings_mut().root = 67;
+        assert_eq!(comp.effective_settings(id).unwrap().root, 67);
         assert_eq!(comp.effective_settings(PatternId(0)).unwrap().root, 67);
-    }
-
-    #[test]
-    fn local_override_can_be_cleared_back_to_inheritance() {
-        let mut comp = Composition::new();
-        let id = comp.create_pattern(4).unwrap();
-        comp.pattern_mut(id).unwrap().settings_mut().root = Setting::Set(48);
-        assert_eq!(comp.effective_settings(id).unwrap().root, 48);
-        comp.pattern_mut(id).unwrap().settings_mut().root = Setting::Inherit;
-        assert_eq!(comp.effective_settings(id).unwrap().root, 60);
-        // Once cleared, the field tracks global changes again.
-        comp.global_settings_mut().root = Setting::Set(62);
-        assert_eq!(comp.effective_settings(id).unwrap().root, 62);
     }
 
     #[test]

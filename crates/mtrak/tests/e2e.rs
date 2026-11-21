@@ -4,11 +4,8 @@
 //! `tests/fixtures/` and the strategy is simply: any MIDI file the loader must
 //! accept is committed as bytes next to the test that reads it.
 
-use std::collections::BTreeMap;
-
 use mtrak_core::composition::{Composition, PatternId};
 use mtrak_core::event::{macro_id, ChannelKind, ChannelMessage, Event, MacroCall, MetaEvent};
-use mtrak_core::settings::Setting;
 use mtrak_core::timing::Bpm;
 use mtrak_engine::lua::{LuaLimits, LuaMacroFactory, LuaRuntime};
 use mtrak_engine::scheduler::TimedEvent;
@@ -23,11 +20,7 @@ fn project_with(rows: usize, tracks: usize) -> TrackerProject {
         pattern.resize_rows(rows).unwrap();
         pattern.resize_tracks(tracks).unwrap();
     }
-    TrackerProject {
-        composition,
-        lua_modules: BTreeMap::new(),
-        setup_source: None,
-    }
+    TrackerProject::new(composition)
 }
 
 fn note(key: u8) -> Event {
@@ -166,9 +159,11 @@ fn project_round_trip_keeps_metadata_without_duplicating_the_fallback() {
         pattern.set_event(0, 1, Event::Meta(MetaEvent::Tempo(400_000)));
     }
     project
-        .lua_modules
+        .modules
         .insert(0x41, "return { run = function() end }".to_string());
-    project.setup_source = Some("register_command('x')".to_string());
+    project
+        .modules
+        .insert(0, "register_command('x')".to_string());
 
     let bytes = smf::save_project(&project, None).unwrap();
     assert!(
@@ -193,11 +188,11 @@ fn project_round_trip_keeps_metadata_without_duplicating_the_fallback() {
         Event::Meta(MetaEvent::Tempo(400_000))
     );
     assert_eq!(
-        loaded.project.lua_modules.get(&0x41).map(String::as_str),
+        loaded.project.modules.get(&0x41).map(String::as_str),
         Some("return { run = function() end }")
     );
     assert_eq!(
-        loaded.project.setup_source.as_deref(),
+        loaded.project.modules.get(&0).map(String::as_str),
         Some("register_command('x')")
     );
 }
@@ -271,7 +266,7 @@ fn sandbox_has_no_host_access_and_runaways_are_bounded() {
             0x41,
             r#"
             return { run = function(a1, a2, ctx)
-                if os ~= nil or io ~= nil or debug ~= nil or require ~= nil then
+                if os ~= nil or io ~= nil or debug ~= nil or package ~= nil then
                     emit(0x90, 1, 1)
                 else
                     emit(0x90, 60, 1)
@@ -331,7 +326,7 @@ fn tui_session_edits_notes_and_commands_and_reloads() {
     // Note entry: enter note mode and write a scale degree.
     app.handle_key(Key::ctrl(Code::Char('n')));
     app.handle_key(Key::ch('z'));
-    assert_eq!(app.cell_text(0, 0).trim_end(), "903C64");
+    assert_eq!(app.cell_display(0, 0).trim_end(), "903C64");
 
     // Pattern management through the command layer.
     app.handle_key(Key::ch(':'));
@@ -415,16 +410,10 @@ fn metadata_decoder_never_panics_on_arbitrary_bytes() {
 }
 
 #[test]
-fn settings_inheritance_survives_a_save_load_cycle() {
+fn global_settings_survive_a_save_load_cycle() {
     let mut project = project_with(4, 1);
-    project.composition.global_settings_mut().root = Setting::Set(67);
+    project.composition.global_settings_mut().root = 67;
     let child = project.composition.create_pattern(4).unwrap();
-    project
-        .composition
-        .pattern_mut(child)
-        .unwrap()
-        .settings_mut()
-        .root = Setting::Set(48);
 
     let bytes = smf::save_project(&project, None).unwrap();
     let loaded = smf::load(&bytes).unwrap();
@@ -437,6 +426,7 @@ fn settings_inheritance_survives_a_save_load_cycle() {
             .root,
         67
     );
+    // Settings are composition-global, so a different pattern sees the same value.
     assert_eq!(
         loaded
             .project
@@ -444,6 +434,6 @@ fn settings_inheritance_survives_a_save_load_cycle() {
             .effective_settings(child)
             .unwrap()
             .root,
-        48
+        67
     );
 }
