@@ -25,6 +25,13 @@ use crate::chooser::ChooserKind;
 use crate::code::{highlight, TokenKind};
 use crate::key::{Code, Key};
 
+/// Background used to band the row the engine is currently playing.
+const PLAY_ROW_BG: Color = Color::Rgb(0, 64, 40);
+/// Foreground for text on the currently playing row.
+const PLAY_ROW_FG: Color = Color::White;
+/// Marks the row the engine is currently playing, left of the first column.
+const PLAY_ROW_MARK: char = '▶';
+
 /// Runs the interactive application until the user quits.
 pub fn run(app: &mut App) -> io::Result<()> {
     run_with(app, |_| {})
@@ -183,7 +190,8 @@ fn draw_pattern(frame: &mut Frame, app: &App, area: Area) {
     let offsets = app.offsets_visible();
     let npc = app.nibbles_per_cell();
     let cell_w = if offsets { 12 } else { 7 };
-    let label_w = 5usize;
+    // Row number, play marker, and the separating space.
+    let label_w = 6usize;
     let visible_tracks = (((inner.width as usize).saturating_sub(label_w)) / cell_w)
         .max(1)
         .min(tracks);
@@ -202,7 +210,7 @@ fn draw_pattern(frame: &mut Frame, app: &App, area: Area) {
 
     let mut lines: Vec<Line> = Vec::new();
     let mut header = vec![Span::styled(
-        format!("{:>4} ", "row"),
+        format!("{:>4}  ", "row"),
         Style::default().fg(Color::DarkGray),
     )];
     for track in track_off..(track_off + visible_tracks).min(tracks) {
@@ -214,12 +222,35 @@ fn draw_pattern(frame: &mut Frame, app: &App, area: Area) {
     lines.push(Line::from(header));
 
     for row in row_off..(row_off + visible_rows).min(rows) {
+        let playing = app.is_playing() && row == app.play_row();
         let row_style = if lpb != 0 && row % lpb == 0 {
             Style::default().fg(Color::Cyan)
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let mut spans = vec![Span::styled(format!("{row:04X} "), row_style)];
+        let row_style = if playing {
+            row_style.bg(PLAY_ROW_BG)
+        } else {
+            row_style
+        };
+        let mut spans = vec![Span::styled(format!("{row:04X}"), row_style)];
+        let marker_style = if playing {
+            Style::default()
+                .fg(PLAY_ROW_FG)
+                .bg(PLAY_ROW_BG)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        spans.push(Span::styled(
+            if playing {
+                PLAY_ROW_MARK.to_string()
+            } else {
+                " ".to_string()
+            },
+            marker_style,
+        ));
+        spans.push(Span::styled(" ", row_style));
         for track in track_off..(track_off + visible_tracks).min(tracks) {
             let text = app.cell_display(row, track);
             let invalid_offset =
@@ -262,12 +293,24 @@ fn draw_pattern(frame: &mut Frame, app: &App, area: Area) {
                         .bg(cursor_bg)
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD);
-                } else if app.is_playing() && row == app.play_row() {
-                    style = style.fg(Color::Green).add_modifier(Modifier::BOLD);
+                } else if playing {
+                    style = style.fg(PLAY_ROW_FG).add_modifier(Modifier::BOLD);
+                    // Keep selection and brush backgrounds visible on top of
+                    // the playback band.
+                    if !in_selection && !in_brush {
+                        style = style.bg(PLAY_ROW_BG);
+                    }
                 }
                 spans.push(Span::styled(ch.to_string(), style));
             }
-            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                " ",
+                if playing {
+                    Style::default().bg(PLAY_ROW_BG)
+                } else {
+                    Style::default()
+                },
+            ));
         }
         lines.push(Line::from(spans));
     }
@@ -516,5 +559,47 @@ fn viewport_scroll(current: usize, cursor: usize, total: usize, visible: usize) 
         (cursor + 1 - visible).min(max)
     } else {
         current.min(max)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mtrak_core::composition::{Composition, PatternId};
+    use ratatui::backend::TestBackend;
+
+    fn app_with(rows: usize, tracks: usize) -> App {
+        let mut project = mtrak_midi_io::TrackerProject::new(Composition::new());
+        {
+            let pattern = project
+                .composition
+                .pattern_mut(PatternId(0))
+                .expect("pattern 0 exists");
+            pattern.resize_rows(rows).unwrap();
+            pattern.resize_tracks(tracks).unwrap();
+        }
+        App::new(project)
+    }
+
+    #[test]
+    fn playing_row_shows_a_marker_and_a_background_band() {
+        let mut app = app_with(8, 2);
+        app.start_playback();
+        assert!(app.is_playing());
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let (x, y) = (0..buffer.area.width)
+            .flat_map(|x| (0..buffer.area.height).map(move |y| (x, y)))
+            .find(|&(x, y)| buffer[(x, y)].symbol() == PLAY_ROW_MARK.to_string())
+            .expect("the playing row is marked");
+        assert_eq!(buffer[(x, y)].bg, PLAY_ROW_BG);
+        // The row number to the left is part of the same band.
+        assert_eq!(buffer[(x - 1, y)].bg, PLAY_ROW_BG);
+        // Only the playing row is banded.
+        let other_bg = buffer[(x, y + 1)].bg;
+        assert_ne!(other_bg, PLAY_ROW_BG);
     }
 }
