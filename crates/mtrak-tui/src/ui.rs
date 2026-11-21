@@ -31,6 +31,10 @@ const PLAY_ROW_BG: Color = Color::Rgb(0, 64, 40);
 const PLAY_ROW_FG: Color = Color::White;
 /// Marks the row the engine is currently playing, left of the first column.
 const PLAY_ROW_MARK: char = '▶';
+/// Separates the hex coordinate labels of the chooser grid.
+const CHOOSER_MARK: char = '·';
+/// Background of the row/column a partially typed chooser byte selects.
+const CHOOSER_AXIS_BG: Color = Color::Rgb(24, 48, 72);
 
 /// Runs the interactive application until the user quits.
 pub fn run(app: &mut App) -> io::Result<()> {
@@ -167,9 +171,9 @@ fn draw_help(frame: &mut Frame, area: Area) {
     let text = vec![
         Line::raw("F1 help   F2 pattern   F3 code"),
         Line::raw(""),
-        Line::raw("Pattern: arrows move  hex types  enter edits  ctrl-enter choose"),
+        Line::raw("Pattern: arrows move  hex types  enter edits  alt-enter choose"),
         Line::raw("         o offsets  space play  : command  ctrl-n note  ctrl-s save"),
-        Line::raw("Code:    ctrl-enter choose module  F5 reload  ctrl-z undo"),
+        Line::raw("Code:    alt-enter choose module  F5 reload  ctrl-z undo"),
     ];
     frame.render_widget(Paragraph::new(text), inner);
 }
@@ -405,9 +409,12 @@ fn draw_chooser(frame: &mut Frame, app: &App, area: Area) {
     let Some(chooser) = app.chooser() else {
         return;
     };
-    let width = 16 * 3 + 2;
-    let height = 16 + 2;
-    let popup = centered(area, width, height);
+    // A row label (`0·`), sixteen two-digit cells with a separating space
+    // each, and the popup borders.
+    let label_w = 3;
+    let width = label_w + 16 * 3 + 2;
+    let height = 1 + 16 + 2;
+    let popup = centered(area, width as u16, height as u16);
     frame.render_widget(Clear, popup);
     let title = match chooser.kind {
         ChooserKind::Pattern => " patterns ",
@@ -417,13 +424,40 @@ fn draw_chooser(frame: &mut Frame, app: &App, area: Area) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
+    let label_style = Style::default().fg(Color::DarkGray);
+    let axis_label_style = label_style.fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    // The row (and, after the second digit, the column) picked out by the hex
+    // digits typed so far.
+    let typed = chooser.typed_row_col();
     let mut lines = Vec::new();
+    let mut header = vec![Span::styled(" ".repeat(label_w), label_style)];
+    for col in 0..16u8 {
+        let style = if typed.is_some_and(|(_, column)| column == Some(col)) {
+            axis_label_style
+        } else {
+            label_style
+        };
+        header.push(Span::styled(format!("{CHOOSER_MARK}{col:X} "), style));
+    }
+    lines.push(Line::from(header));
     for row in 0..16u8 {
-        let mut spans = Vec::new();
+        let in_row = typed.is_some_and(|(typed_row, _)| typed_row == row);
+        let mut spans = vec![Span::styled(
+            format!("{row:X}{CHOOSER_MARK} "),
+            if in_row {
+                axis_label_style
+            } else {
+                label_style
+            },
+        )];
         for col in 0..16u8 {
             let id = row * 16 + col;
             let (label, style) = chooser_cell(app, chooser.kind, id);
             let mut style = style;
+            let in_col = typed.is_some_and(|(_, column)| column == Some(col));
+            if in_row || in_col {
+                style = style.bg(CHOOSER_AXIS_BG);
+            }
             if id == chooser.cursor {
                 style = style
                     .bg(Color::Blue)
@@ -431,7 +465,15 @@ fn draw_chooser(frame: &mut Frame, app: &App, area: Area) {
                     .add_modifier(Modifier::BOLD);
             }
             spans.push(Span::styled(label, style));
-            spans.push(Span::raw(" "));
+            // Keep the guide band continuous across the column gaps.
+            spans.push(Span::styled(
+                " ",
+                if in_row || in_col {
+                    Style::default().bg(CHOOSER_AXIS_BG)
+                } else {
+                    Style::default()
+                },
+            ));
         }
         lines.push(Line::from(spans));
     }
@@ -513,9 +555,9 @@ fn draw_status(frame: &mut Frame, app: &App, area: Area) {
             let hint = match app.screen() {
                 Screen::Help => "F2 pattern  F3 code  ctrl-q quit",
                 Screen::Pattern => {
-                    "space play  s start  : command  enter edit  ctrl-enter choose  ctrl-s save"
+                    "space play  s start  : command  enter edit  alt-enter choose  ctrl-s save"
                 }
-                Screen::Code => "ctrl-enter choose module  F5 reload  ctrl-z undo  ctrl-s save",
+                Screen::Code => "alt-enter choose module  F5 reload  ctrl-z undo  ctrl-s save",
             };
             Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))
         }
@@ -601,5 +643,93 @@ mod tests {
         // Only the playing row is banded.
         let other_bg = buffer[(x, y + 1)].bg;
         assert_ne!(other_bg, PLAY_ROW_BG);
+    }
+
+    fn screen_rows(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn chooser_renders_hex_row_and_column_labels() {
+        let mut app = app_with(4, 2);
+        app.handle_key(Key::alt(Code::Enter));
+        assert_eq!(app.mode(), Mode::Chooser);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rows = screen_rows(terminal.backend().buffer());
+
+        assert!(
+            rows.iter()
+                .any(|line| line.contains("·0 ·1 ·2 ·3 ·4 ·5 ·6 ·7 ·8 ·9 ·A ·B ·C ·D ·E ·F")),
+            "column labels: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|line| line.contains("0· 00 .. ..")),
+            "row labels and cells: {rows:#?}"
+        );
+        assert!(rows.iter().any(|line| line.contains("F· ")));
+    }
+
+    #[test]
+    fn typing_a_byte_bands_its_row_and_then_its_column() {
+        let mut app = app_with(4, 2);
+        app.handle_key(Key::alt(Code::Enter));
+
+        // Coordinates of cell (row, col): the popup is centered, has a border,
+        // and a three-cell label before the 3-cell-wide cells.
+        let popup = centered(
+            Area {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            53,
+            19,
+        );
+        let cell = |row: u16, col: u16| (popup.x + 1 + 3 + 3 * col, popup.y + 1 + 1 + row);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        app.handle_key(Key::ch('4'));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        assert_eq!(buffer[cell(4, 0)].bg, CHOOSER_AXIS_BG, "row 4 is banded");
+        assert_eq!(buffer[cell(4, 15)].bg, CHOOSER_AXIS_BG);
+        assert_ne!(buffer[cell(3, 0)].bg, CHOOSER_AXIS_BG);
+        assert_ne!(
+            buffer[cell(0, 15)].bg,
+            CHOOSER_AXIS_BG,
+            "no column is known yet"
+        );
+
+        app.handle_key(Key::ch('F'));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        assert_eq!(
+            buffer[cell(0, 15)].bg,
+            CHOOSER_AXIS_BG,
+            "column F is banded"
+        );
+        assert_eq!(buffer[cell(4, 0)].bg, CHOOSER_AXIS_BG, "row 4 stays");
+        assert_eq!(
+            buffer[cell(4, 15)].bg,
+            Color::Blue,
+            "the jumped-to cell keeps the cursor highlight"
+        );
+        assert_ne!(buffer[cell(0, 14)].bg, CHOOSER_AXIS_BG);
+
+        // Moving abandons the typed byte and its bands.
+        app.handle_key(Key::new(Code::Right));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        assert_ne!(buffer[cell(0, 15)].bg, CHOOSER_AXIS_BG);
+        assert_ne!(buffer[cell(4, 0)].bg, CHOOSER_AXIS_BG);
     }
 }

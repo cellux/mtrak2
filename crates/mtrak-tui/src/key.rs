@@ -95,6 +95,16 @@ impl Key {
         }
     }
 
+    /// An Alt-modified key.
+    pub fn alt(code: Code) -> Self {
+        Key {
+            code,
+            ctrl: false,
+            shift: false,
+            alt: true,
+        }
+    }
+
     /// A plain character key.
     pub fn ch(c: char) -> Self {
         Key::new(Code::Char(c))
@@ -202,6 +212,11 @@ pub enum Action {
 pub fn lookup(key: Key) -> Option<Action> {
     use Action as A;
     use Code::*;
+    // Alt-Enter is the portable chooser binding: unlike Ctrl-Enter it is
+    // distinguishable from plain Enter in every common terminal.
+    if key.alt && key.code == Enter {
+        return Some(A::OpenChooser);
+    }
     let action = match (key.code, key.ctrl, key.shift) {
         (Char('q'), true, _) => A::Quit,
         (Left, false, false) => A::MoveLeft,
@@ -245,8 +260,9 @@ pub fn lookup(key: Key) -> Option<Action> {
         (Char('z'), true, _) => A::Undo,
         (Char('r'), true, _) => A::Redo,
         (Char('s'), true, _) => A::Save,
-        (Enter, true, _) => A::OpenChooser,
-        (Enter, false, _) => A::OpenEventEditor,
+        // Ctrl-Enter is indistinguishable from Enter in many terminals, so it
+        // deliberately keeps the plain-Enter behavior.
+        (Enter, _, _) => A::OpenEventEditor,
         (Function(1), false, _) => A::HelpScreen,
         (Function(2), false, _) => A::PatternScreen,
         (Function(3), false, _) => A::CodeScreen,
@@ -300,6 +316,12 @@ mod tests {
         assert_eq!(lookup(Key::ctrl(Code::Char('r'))), Some(Action::Redo));
         assert_eq!(lookup(Key::ctrl(Code::Char('s'))), Some(Action::Save));
         assert_eq!(lookup(Key::new(Code::Enter)), Some(Action::OpenEventEditor));
+        assert_eq!(
+            lookup(Key::ctrl(Code::Enter)),
+            Some(Action::OpenEventEditor),
+            "Ctrl-Enter is not a supported binding"
+        );
+        assert_eq!(lookup(Key::alt(Code::Enter)), Some(Action::OpenChooser));
     }
 
     #[test]

@@ -2389,7 +2389,7 @@ impl App {
         match key.code {
             Code::Char('z') if key.ctrl => self.undo_module(),
             Code::Char('r') if key.ctrl => self.redo_module(),
-            Code::Enter if key.ctrl => self.open_chooser(),
+            Code::Enter if key.alt => self.open_chooser(),
             Code::Function(5) => self.reload_lua(),
             Code::Left => self.code.move_left(),
             Code::Right => self.code.move_right(),
@@ -2930,6 +2930,21 @@ mod tests {
         assert_eq!(app.screen(), Screen::Help);
         app.handle_key(Key::new(Code::Function(2)));
         assert_eq!(app.screen(), Screen::Pattern);
+    }
+
+    #[test]
+    fn alt_enter_opens_the_chooser() {
+        let mut app = app_with(4, 2);
+        app.handle_key(Key::alt(Code::Enter));
+        assert_eq!(app.mode(), Mode::Chooser);
+        app.handle_key(Key::new(Code::Esc));
+
+        // On the Code screen Alt-Enter must not fall through to a newline.
+        app.handle_key(Key::new(Code::Function(3)));
+        let lines = app.code_editor().line_count();
+        app.handle_key(Key::alt(Code::Enter));
+        assert_eq!(app.mode(), Mode::Chooser);
+        assert_eq!(app.code_editor().line_count(), lines);
     }
 
     #[test]
