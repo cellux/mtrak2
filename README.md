@@ -36,6 +36,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
+A `Makefile` wraps the common commands; `make` (or `make help`) lists them:
+`make build`, `make release`, `make test`, `make verify`, and more.
+
 Real-time MIDI output is gated behind the `midir-backend` feature of
 `mtrak-midi`, so the rest of the workspace builds without a system MIDI stack.
 
