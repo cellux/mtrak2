@@ -35,6 +35,11 @@ const PLAY_ROW_BG: Color = Color::Rgb(0, 64, 40);
 const PLAY_ROW_FG: Color = Color::White;
 /// Marks the row the engine is currently playing, left of the first column.
 const PLAY_ROW_MARK: char = '▶';
+/// Marks the configured playback start row in the same column as the playhead
+/// marker; its color distinguishes it.
+const START_ROW_MARK: char = '▶';
+/// Foreground of the playback start-row marker.
+const START_ROW_FG: Color = Color::Yellow;
 /// Separates the hex coordinate labels of the chooser grid.
 const CHOOSER_MARK: char = '·';
 /// Background of the row/column a partially typed chooser byte selects.
@@ -295,22 +300,26 @@ fn draw_pattern(frame: &mut Frame, app: &App, area: Area) {
             row_style
         };
         let mut spans = vec![Span::styled(format!("{row:04X}"), row_style)];
-        let marker_style = if playing {
-            Style::default()
-                .fg(PLAY_ROW_FG)
-                .bg(PLAY_ROW_BG)
-                .add_modifier(Modifier::BOLD)
+        let starting = row == app.start_row();
+        let (marker_style, marker) = if playing {
+            (
+                Style::default()
+                    .fg(PLAY_ROW_FG)
+                    .bg(PLAY_ROW_BG)
+                    .add_modifier(Modifier::BOLD),
+                PLAY_ROW_MARK,
+            )
+        } else if starting {
+            (
+                Style::default()
+                    .fg(START_ROW_FG)
+                    .add_modifier(Modifier::BOLD),
+                START_ROW_MARK,
+            )
         } else {
-            Style::default()
+            (Style::default(), ' ')
         };
-        spans.push(Span::styled(
-            if playing {
-                PLAY_ROW_MARK.to_string()
-            } else {
-                " ".to_string()
-            },
-            marker_style,
-        ));
+        spans.push(Span::styled(marker.to_string(), marker_style));
         spans.push(Span::styled(" ", row_style));
         for track in track_off..(track_off + visible_tracks).min(tracks) {
             let text = app.cell_display(row, track);
@@ -808,6 +817,47 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn start_row_marker_shares_the_playhead_column_with_its_own_color() {
+        use crate::key::Action;
+
+        let mut app = app_with(8, 1);
+        app.apply(Action::MoveDown);
+        app.apply(Action::MoveDown);
+        app.apply(Action::SetStartRow);
+        app.apply(Action::Home);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let row_marks = |terminal: &mut Terminal<TestBackend>, app: &App, label: &str| {
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let rows = screen_rows(buffer);
+            let y = rows
+                .iter()
+                .position(|line| line.contains(label))
+                .unwrap_or_else(|| panic!("row {label} is visible"));
+            let chars: Vec<char> = rows[y].chars().collect();
+            (chars[5], chars[6], buffer[(5, y as u16)].fg)
+        };
+
+        assert_eq!(
+            row_marks(&mut terminal, &app, "0002"),
+            (START_ROW_MARK, ' ', START_ROW_FG),
+            "the start row uses the playhead column with its own color"
+        );
+        assert_eq!(
+            row_marks(&mut terminal, &app, "0000"),
+            (' ', ' ', Color::Reset)
+        );
+
+        app.start_playback();
+        assert_eq!(
+            row_marks(&mut terminal, &app, "0002"),
+            (PLAY_ROW_MARK, ' ', PLAY_ROW_FG),
+            "the playhead marker wins when it reaches the start row"
+        );
     }
 
     #[test]

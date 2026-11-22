@@ -57,10 +57,38 @@ Verification: `cargo fmt --all -- --check` clean;
 `cargo test --workspace` 284 tests (158 `mtrak-tui`, 46 `mtrak-core`, 44
 `mtrak-engine`, 19 `mtrak-midi-io`, 12 end-to-end, 5 `mtrak-midi`).
 
+## 2026-11-22T19:45:31Z — Start-row marker in the pattern gutter
+
+Added a visible playback start-row indicator to the pattern grid. The start
+row uses the same `▶` glyph as the playhead in the existing spacer column one
+to the right of the playhead marker, styled yellow (and kept on the playing-row
+band when both markers coincide). The gutter width is unchanged. Added a UI
+test that checks the marker column, its absence on other rows, and both markers
+appearing side by side when the playhead reaches the start row.
+
+Verification: `cargo fmt --all -- --check` clean;
+`cargo clippy --workspace --all-targets -- -D warnings` clean;
+`cargo test --workspace` 285 tests.
+
+## 2026-11-22T19:49:49Z — Start-row marker moved into the playhead column
+
+Moved the playback start-row `▶` marker into the same gutter column as the
+playhead marker, relying on color to distinguish them: yellow for the
+configured start row, white on the play band for the live playhead. When the
+playhead reaches the start row, the playhead marker takes precedence. The
+spacer column stays blank and the gutter width is unchanged. Updated the UI
+test to assert the shared column, the marker colors, and the playhead
+precedence.
+
+Verification: `cargo fmt --all -- --check` clean;
+`cargo clippy --workspace --all-targets -- -D warnings` clean;
+`cargo test --workspace` 285 tests.
+
 ## HANDOFF
 
-**State:** The PLAY/REC/EDIT milestone is implemented and green. No pending
-work is known.
+**State:** The PLAY/REC/EDIT milestone is implemented and green, including a
+yellow start-row marker in the playhead gutter column. No pending work is
+known.
 
 **Durable decisions:** PR-001…PR-010 in `DECISIONS.md`.
 
