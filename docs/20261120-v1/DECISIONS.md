@@ -252,3 +252,12 @@ All previously open decisions below were accepted as written before implementati
 - Source: the same comparison; TPB=480 and 960 imports drive the engine clock 20-40x faster than a TPB=24 project.
 - Rationale: `k` dividing every event tick is exactly the row-boundary constraint — an event's row is `tick / row_ticks` and its offset is `tick % row_ticks`, and both scale by `1/k`, so no event leaves the row it started on. Reducing further would push events off their rows or move them in time. The engine's step cost is `O(instances x tracks)` per tick, so a dense clock multiplies the cost of every running pattern and every tick-granular macro.
 - Consequence: foreign files at TPB=480 or 960 import at 96 when their events allow it; files whose events sit on odd ticks keep their original resolution. mtrak's own saved projects are unaffected, because they round-trip through the metadata chunk rather than the standard import.
+
+### D-036 — Randomness is seeded by the composition and deterministic
+
+- Status: Accepted
+- Question: macros need randomness, but the engine promises byte-identical runs and a render must be a pure function of the saved project. Stock `math.random` is unseeded and breaks both.
+- Resolution: the composition carries a `u64` seed, settable with `:seed`, and macros draw from deterministic SplitMix64 series. `math.random` is shadowed with a version that draws from the composition-seeded global series; `math.randomseed` is refused. `RandomGenerator(seed)` creates an independent generator a macro owns, drawn with `rng:next(...)` or `rng(...)`, with the same argument conventions as `math.random`. The seed is saved in the project metadata and reseeded at every render.
+- Source: comparing mtrak's playback against fluidsynth's own player; the determinism hole was found while assessing pre-render versus run-time macro execution.
+- Rationale: a pure render makes export and playback provably equivalent, makes re-render-and-splice a valid way to audition edits mid-song, and keeps "byte-identical runs" meaningful. Splitting the API lets a macro choose between composition-wide variation (`math.random`) and its own reproducible series (`RandomGenerator`).
+- Consequence: macros can no longer reach an unseeded RNG. A render depends on the seed, so changing it changes the audio even though the events are unchanged. `RandomGenerator` ignores the composition seed by design, so a macro that wants to follow `:seed` passes `ctx.seed` to it.

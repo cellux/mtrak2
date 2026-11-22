@@ -53,17 +53,20 @@ pub struct MacroCtx {
     /// The composition's ticks per beat, used to convert beat-denominated
     /// macro waits into ticks.
     tpb: u32,
+    /// The composition's random seed, exposed to macros as `ctx.seed`.
+    seed: u64,
     settings: Settings,
     actions: Vec<MacroAction>,
 }
 
 impl MacroCtx {
     /// Creates a context for a macro resumed at `tick` on `track`.
-    pub fn new(tick: Ticks, track: usize, tpb: u32, settings: Settings) -> Self {
+    pub fn new(tick: Ticks, track: usize, tpb: u32, seed: u64, settings: Settings) -> Self {
         MacroCtx {
             tick,
             track,
             tpb,
+            seed,
             settings,
             actions: Vec::new(),
         }
@@ -77,6 +80,11 @@ impl MacroCtx {
     /// The composition's ticks per beat.
     pub fn tpb(&self) -> u32 {
         self.tpb
+    }
+
+    /// The composition's random seed.
+    pub fn seed(&self) -> u64 {
+        self.seed
     }
 
     /// Requests that `event` be emitted at the current tick.
@@ -120,4 +128,11 @@ pub trait Macro {
 pub trait MacroFactory {
     /// Creates a coroutine for `call`, or `None` if the ID is unknown.
     fn create(&mut self, call: MacroCall) -> Option<Box<dyn Macro>>;
+
+    /// Reseeds the factory's deterministic random series.
+    ///
+    /// Called once per render with the composition's seed, so a render is a
+    /// pure function of the saved project. Implementations without randomness
+    /// keep the default no-op.
+    fn set_seed(&mut self, _seed: u64) {}
 }

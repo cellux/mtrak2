@@ -784,6 +784,62 @@ mod tests {
     }
 
     #[test]
+    fn project_round_trip_preserves_the_seed() {
+        let mut project = sample_project();
+        project.composition.set_seed(0xDEAD_BEEF_1234_5678);
+        let bytes = save_project(&project, None).unwrap();
+        let loaded = load(&bytes).unwrap();
+        assert!(loaded.was_project);
+        assert_eq!(
+            loaded.project.composition.seed(),
+            0xDEAD_BEEF_1234_5678,
+            "the seed must survive a project save/load"
+        );
+    }
+
+    #[test]
+    fn render_is_deterministic_for_a_fixed_seed() {
+        use mtrak_engine::lua::LuaMacroFactory;
+        use mtrak_engine::lua::{LuaLimits, LuaRuntime};
+
+        let mut composition = Composition::new();
+        composition.set_seed(4242);
+        {
+            let pattern = composition.pattern_mut(PatternId(0)).unwrap();
+            pattern.resize_rows(4).unwrap();
+            pattern.set_event(0, 0, Event::Macro(MacroCall::new(0x40, 0, 0)));
+        }
+        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        runtime
+            .load_module(
+                0x40,
+                r#"
+                return { run = function(a1, a2, ctx)
+                    for _ = 1, 6 do
+                        emit(0x90, math.random(0, 127), 100)
+                    end
+                end }
+                "#,
+            )
+            .unwrap();
+
+        let render = |composition: &Composition| {
+            let factory = Box::new(LuaMacroFactory::new(runtime.clone()));
+            render_events(composition, Some(factory))
+        };
+
+        let first = render(&composition);
+        let second = render(&composition);
+        assert!(!first.is_empty());
+        assert_eq!(first, second, "a fixed seed must render identically");
+
+        let mut other = composition.clone();
+        other.set_seed(9999);
+        let third = render(&other);
+        assert_ne!(first, third, "a different seed must change the render");
+    }
+
+    #[test]
     fn strict_import_rejects_malformed_containers() {
         // Missing MThd.
         assert!(load(b"not a midi file").is_err());

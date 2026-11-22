@@ -24,6 +24,7 @@ use mtrak_core::settings::{Scale, Settings};
 use mtrak_core::timing::Ticks;
 
 use crate::macros::{Macro, MacroAction, MacroCtx, MacroFactory, SettingChange};
+use crate::rng::{self, SplitMix64};
 
 /// Interval, in VM instructions, between instruction-budget hook checks.
 const HOOK_INTERVAL: u32 = 1_000;
@@ -90,6 +91,8 @@ struct RuntimeState {
     settings: Option<Settings>,
     track: usize,
     tick: Ticks,
+    /// The composition-seeded global series behind `math.random`.
+    rng: Rc<RefCell<SplitMix64>>,
 }
 
 enum ResumeOutcome {
@@ -143,6 +146,15 @@ impl LuaRuntime {
             lua,
             inner: Rc::new(RefCell::new(inner)),
         })
+    }
+
+    /// Reseeds the global random series.
+    ///
+    /// Called once per render with the composition's seed, so a render is a
+    /// pure function of the saved project.
+    pub fn set_seed(&self, seed: u64) {
+        let shared = self.inner.borrow().shared.clone();
+        shared.borrow().rng.borrow_mut().reseed(seed);
     }
 
     /// Stores a module source without evaluating it. Used for lazy loading.
@@ -469,8 +481,18 @@ fn install_api(
         })?,
     )?;
 
+    // The RNG lives in the shared state so every module draws from the same
+    // composition-seeded series.
+    let global_rng = shared.borrow().rng.clone();
+    rng::install(lua, env, global_rng)?;
+
     let globals = lua.globals();
     for name in SAFE_GLOBALS {
+        // `math` is installed by `rng::install` with its random entries
+        // replaced, so the stock table must not be copied over it.
+        if *name == "math" {
+            continue;
+        }
         if let Ok(value) = globals.get::<Value>(*name) {
             if !matches!(value, Value::Nil) {
                 env.set(*name, value)?;
@@ -572,7 +594,8 @@ impl LuaMacro {
         let result = if self.started {
             self.thread.resume::<MultiValue>(())
         } else {
-            let context = context_table(&self.lua, ctx.settings(), ctx.track, ctx.tick)?;
+            let context =
+                context_table(&self.lua, ctx.settings(), ctx.track, ctx.tick, ctx.seed())?;
             self.thread
                 .resume::<MultiValue>((i64::from(self.arg1), i64::from(self.arg2), context))
         };
@@ -618,6 +641,10 @@ impl LuaMacroFactory {
 }
 
 impl MacroFactory for LuaMacroFactory {
+    fn set_seed(&mut self, seed: u64) {
+        self.runtime.set_seed(seed);
+    }
+
     fn create(&mut self, call: MacroCall) -> Option<Box<dyn Macro>> {
         self.runtime
             .create_macro(call)
@@ -626,10 +653,17 @@ impl MacroFactory for LuaMacroFactory {
     }
 }
 
-fn context_table(lua: &Lua, settings: Settings, track: usize, tick: Ticks) -> mlua::Result<Table> {
+fn context_table(
+    lua: &Lua,
+    settings: Settings,
+    track: usize,
+    tick: Ticks,
+    seed: u64,
+) -> mlua::Result<Table> {
     let context = lua.create_table()?;
     context.set("track", track as i64)?;
     context.set("tick", tick as i64)?;
+    context.set("seed", seed as i64)?;
     let s = lua.create_table()?;
     s.set("root", i64::from(settings.root))?;
     s.set("scale", i64::from(settings.scale.mask()))?;
@@ -868,6 +902,162 @@ mod tests {
         let engine = run(pattern_with_macro(0x43, 0, 0), &runtime);
         assert!(notes(&engine).is_empty());
         assert!(!engine.overflowed());
+    }
+
+    #[test]
+    fn math_random_is_deterministic_per_seed() {
+        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        runtime
+            .load_module(
+                0x7A,
+                r#"
+                return function(a1, a2, ctx)
+                    for _ = 1, 8 do
+                        emit(0x90, math.random(0, 127), 100)
+                    end
+                end
+                "#,
+            )
+            .unwrap();
+        let mut first = pattern_with_macro(0x7A, 0, 0);
+        first.set_seed(7);
+        let mut second = pattern_with_macro(0x7A, 0, 0);
+        second.set_seed(7);
+        let a = run(first, &runtime);
+        let b = run(second, &runtime);
+        assert_eq!(notes(&a).len(), 8);
+        assert_eq!(notes(&a), notes(&b), "same seed must reproduce the series");
+        assert!(a.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn different_seeds_change_the_output() {
+        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        runtime
+            .load_module(
+                0x7B,
+                r#"
+                return function(a1, a2, ctx)
+                    for _ = 1, 8 do
+                        emit(0x90, math.random(0, 127), 100)
+                    end
+                end
+                "#,
+            )
+            .unwrap();
+        let mut first = pattern_with_macro(0x7B, 0, 0);
+        first.set_seed(1);
+        let mut second = pattern_with_macro(0x7B, 0, 0);
+        second.set_seed(2);
+        let a = run(first, &runtime);
+        let b = run(second, &runtime);
+        assert_ne!(notes(&a), notes(&b), "different seeds must diverge");
+    }
+
+    #[test]
+    fn random_generator_is_independent_of_the_global_series() {
+        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        runtime
+            .load_module(
+                0x7C,
+                r#"
+                return function(a1, a2, ctx)
+                    local rng = RandomGenerator(99)
+                    for _ = 1, 4 do
+                        emit(0x90, rng:next(0, 127), 100)
+                    end
+                    emit(0x91, rng(0, 127), 100)
+                end
+                "#,
+            )
+            .unwrap();
+        // The composition seed changes the global series but must not touch an
+        // explicitly constructed generator.
+        let mut first = pattern_with_macro(0x7C, 0, 0);
+        first.set_seed(1);
+        let mut second = pattern_with_macro(0x7C, 0, 0);
+        second.set_seed(2);
+        let a = run(first, &runtime);
+        let b = run(second, &runtime);
+        assert_eq!(notes(&a).len(), 5);
+        assert_eq!(notes(&a), notes(&b), "RandomGenerator ignores the seed");
+        assert!(a.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn random_generator_reproduces_across_renders() {
+        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        runtime
+            .load_module(
+                0x7D,
+                r#"
+                return function(a1, a2, ctx)
+                    local rng = RandomGenerator(1234)
+                    for _ = 1, 4 do
+                        emit(0x90, rng.next(0, 127), 100)
+                    end
+                end
+                "#,
+            )
+            .unwrap();
+        let a = run(pattern_with_macro(0x7D, 0, 0), &runtime);
+        let b = run(pattern_with_macro(0x7D, 0, 0), &runtime);
+        assert_eq!(notes(&a), notes(&b));
+    }
+
+    #[test]
+    fn math_random_follows_lua_conventions() {
+        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        runtime
+            .load_module(
+                0x7E,
+                r#"
+                return function(a1, a2, ctx)
+                    if math.type(math.random()) ~= "float" then
+                        error("no-argument random should return a float")
+                    end
+                    if math.type(math.random(0)) ~= "integer" then
+                        error("zero-argument random should return an integer")
+                    end
+                    emit(0x90, math.random(5, 5), 100)
+                    emit(0x91, math.random(1), 100)
+                    emit(0x92, math.random(0, 0), 100)
+                end
+                "#,
+            )
+            .unwrap();
+        let engine = run(pattern_with_macro(0x7E, 0, 0), &runtime);
+        assert!(
+            engine.diagnostics().is_empty(),
+            "{:?}",
+            engine.diagnostics()
+        );
+        let keys: Vec<u8> = notes(&engine).into_iter().map(|(_, _, key)| key).collect();
+        assert_eq!(keys, vec![5, 1, 0]);
+    }
+
+    #[test]
+    fn math_randomseed_is_refused() {
+        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        runtime
+            .load_module(
+                0x7F,
+                r#"
+                return function(a1, a2, ctx)
+                    math.randomseed(1)
+                end
+                "#,
+            )
+            .unwrap();
+        let engine = run(pattern_with_macro(0x7F, 0, 0), &runtime);
+        assert!(
+            engine
+                .diagnostics()
+                .iter()
+                .any(|d| d.contains("math.randomseed")),
+            "{:?}",
+            engine.diagnostics()
+        );
     }
 
     #[test]

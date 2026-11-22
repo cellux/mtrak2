@@ -301,7 +301,8 @@ The retained commands are:
 - `:sca ...` and `:s ...`: aliases for `:scale`;
 - `:mode INTEGER`, `:m INTEGER`: set the modal degree;
 - `:rows INTEGER`: resize the current pattern;
-- `:tracks INTEGER`: resize the current pattern's track count.
+- `:tracks INTEGER`: resize the current pattern's track count;
+- `:seed [VALUE|random]`: show the composition's random seed, set it to `VALUE`, or draw a fresh one with `random` (see D-036).
 
 The scale command additionally supports user-defined scales:
 

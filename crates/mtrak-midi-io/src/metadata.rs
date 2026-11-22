@@ -186,6 +186,10 @@ pub fn encode_project(project: &TrackerProject) -> Vec<u8> {
         w.u32(project.composition.bpm().q8_8());
         w.u32(project.composition.tpb());
         w.u8(project.composition.selected_main().value());
+        // Trailing and optional: blobs written before the seed existed end
+        // after the u8, and a reader that ignores the remainder still loads
+        // them.
+        w.u64(project.composition.seed());
     });
     section(&mut w, TAG_GLOBAL_SETTINGS, |w| {
         write_settings(w, project.composition.global_settings());
@@ -224,6 +228,7 @@ pub fn decode_project(blob: &[u8]) -> Result<TrackerProject, MetadataError> {
     let mut r = Reader::new(blob);
     let mut bpm = Bpm::DEFAULT;
     let mut tpb = 24u32;
+    let mut seed = 0u64;
     let mut selected = PatternId(0);
     let mut global_settings = Settings::new();
     let mut registry = ScaleRegistry::new();
@@ -240,6 +245,10 @@ pub fn decode_project(blob: &[u8]) -> Result<TrackerProject, MetadataError> {
                     .ok_or_else(|| MetadataError::Invalid("tempo".to_string()))?;
                 tpb = s.u32()?;
                 selected = PatternId(s.u8()?);
+                // Optional trailing seed.
+                if !s.is_done() {
+                    seed = s.u64()?;
+                }
             }
             TAG_GLOBAL_SETTINGS => {
                 global_settings = read_settings(&mut s)?;
@@ -278,6 +287,7 @@ pub fn decode_project(blob: &[u8]) -> Result<TrackerProject, MetadataError> {
 
     let mut composition = Composition::empty();
     composition.set_bpm(bpm);
+    composition.set_seed(seed);
     composition.set_tpb_raw(tpb).map_err(comp_err)?;
     *composition.global_settings_mut() = global_settings;
     *composition.scales_mut() = registry;
@@ -481,6 +491,10 @@ impl Writer {
         self.buf.extend_from_slice(&value.to_be_bytes());
     }
 
+    fn u64(&mut self, value: u64) {
+        self.buf.extend_from_slice(&value.to_be_bytes());
+    }
+
     fn bytes(&mut self, value: &[u8]) {
         self.buf.extend_from_slice(value);
     }
@@ -532,6 +546,13 @@ impl<'a> Reader<'a> {
     fn u32(&mut self) -> Result<u32, MetadataError> {
         let bytes = self.take(4)?;
         Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn u64(&mut self) -> Result<u64, MetadataError> {
+        let bytes = self.take(8)?;
+        Ok(u64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
     }
 
     fn blob(&mut self) -> Result<&'a [u8], MetadataError> {
@@ -656,5 +677,23 @@ mod tests {
         let project = sample_project();
         let blob = encode_project(&project);
         assert!(decode_project(&blob[..blob.len() / 2]).is_err());
+    }
+
+    #[test]
+    fn blobs_written_before_the_seed_load_with_seed_zero() {
+        let mut project = sample_project();
+        project.composition.set_seed(0x1234_5678_9ABC_DEF0);
+        let mut blob = encode_project(&project);
+        // The composition section comes first: tag, u32 length, then the body.
+        // Strip the trailing seed so the blob matches one written before it
+        // existed, and shrink the length prefix to match.
+        assert_eq!(blob[0], TAG_COMPOSITION);
+        let len = u32::from_be_bytes([blob[1], blob[2], blob[3], blob[4]]) as usize;
+        let seed_start = 5 + len - 8;
+        blob.drain(seed_start..seed_start + 8);
+        blob[1..5].copy_from_slice(&((len - 8) as u32).to_be_bytes());
+
+        let loaded = decode_project(&blob).unwrap();
+        assert_eq!(loaded.composition.seed(), 0, "old blobs default the seed");
     }
 }

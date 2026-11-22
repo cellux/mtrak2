@@ -26,6 +26,17 @@ pub struct ScaleArgs {
     pub delete: Option<String>,
 }
 
+/// Argument to `:seed`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SeedArg {
+    /// Show the current seed without changing it.
+    Show,
+    /// Set an explicit seed.
+    Set(u64),
+    /// Draw a fresh seed from system entropy.
+    Random,
+}
+
 /// A parsed colon command.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Command {
@@ -67,6 +78,8 @@ pub enum Command {
     Event(Vec<u8>),
     /// `:follow` — toggle scrolling with the playhead.
     Follow,
+    /// `:seed [VALUE|random]` — inspect or change the random seed.
+    Seed(SeedArg),
     /// `:help`.
     Help,
 }
@@ -81,6 +94,19 @@ pub fn parse_int(input: &str) -> Option<u32> {
         u32::from_str_radix(hex, 16).ok()
     } else {
         input.parse::<u32>().ok()
+    }
+}
+
+/// Parses a 64-bit integer in decimal or `0x` hexadecimal.
+pub fn parse_u64(input: &str) -> Option<u64> {
+    let input = input.trim();
+    if let Some(hex) = input
+        .strip_prefix("0x")
+        .or_else(|| input.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        input.parse::<u64>().ok()
     }
 }
 
@@ -121,6 +147,18 @@ pub fn parse(input: &str) -> Result<Command, String> {
         "port" | "midi" => parse_port(&rest)?,
         "event" | "ev" => Command::Event(parse_event_bytes(&rest)?),
         "follow" | "fol" => Command::Follow,
+        "seed" => {
+            let raw = rest.first().map(|value| value.to_ascii_lowercase());
+            match raw.as_deref() {
+                None => Command::Seed(SeedArg::Show),
+                Some("random") => Command::Seed(SeedArg::Random),
+                Some(other) => {
+                    let value = parse_u64(other)
+                        .ok_or_else(|| format!("invalid value for seed: {other}"))?;
+                    Command::Seed(SeedArg::Set(value))
+                }
+            }
+        }
         "help" | "h" | "?" => Command::Help,
         other => return Err(format!("unknown command: {other}")),
     };
@@ -302,6 +340,14 @@ mod tests {
         );
         assert_eq!(parse(":follow"), Ok(Command::Follow));
         assert_eq!(parse(":fol"), Ok(Command::Follow));
+        assert_eq!(parse(":seed"), Ok(Command::Seed(SeedArg::Show)));
+        assert_eq!(parse(":seed 42"), Ok(Command::Seed(SeedArg::Set(42))));
+        assert_eq!(
+            parse(":seed 0xDEADBEEF"),
+            Ok(Command::Seed(SeedArg::Set(0xDEADBEEF)))
+        );
+        assert_eq!(parse(":seed random"), Ok(Command::Seed(SeedArg::Random)));
+        assert!(parse(":seed nonsense").is_err());
     }
 
     #[test]

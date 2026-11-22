@@ -244,6 +244,12 @@ pub enum CompositionError {
 pub struct Composition {
     bpm: Bpm,
     tpb: u32,
+    /// Seed for the deterministic random series macros draw from.
+    ///
+    /// Part of the composition so a render is a pure function of the saved
+    /// project: the same seed and the same events always produce the same
+    /// audio. Settable with `:seed`.
+    seed: u64,
     global_settings: Settings,
     scales: ScaleRegistry,
     patterns: Vec<Option<Pattern>>,
@@ -260,6 +266,7 @@ impl Composition {
         Composition {
             bpm: Bpm::DEFAULT,
             tpb: DEFAULT_TPB,
+            seed: 0,
             global_settings: Settings::new(),
             scales: ScaleRegistry::new(),
             patterns,
@@ -274,6 +281,7 @@ impl Composition {
         Composition {
             bpm: Bpm::DEFAULT,
             tpb: DEFAULT_TPB,
+            seed: 0,
             global_settings: Settings::new(),
             scales: ScaleRegistry::new(),
             patterns,
@@ -326,6 +334,16 @@ impl Composition {
     /// Composition tempo.
     pub fn bpm(&self) -> Bpm {
         self.bpm
+    }
+
+    /// The random seed macros draw from.
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// Sets the random seed macros draw from.
+    pub fn set_seed(&mut self, seed: u64) {
+        self.seed = seed;
     }
 
     /// Sets the composition tempo.

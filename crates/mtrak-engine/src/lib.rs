@@ -9,4 +9,5 @@
 
 pub mod lua;
 pub mod macros;
+pub mod rng;
 pub mod scheduler;

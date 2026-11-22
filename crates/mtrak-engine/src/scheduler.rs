@@ -187,7 +187,10 @@ impl Engine {
     }
 
     /// Installs a factory for user macro coroutines.
-    pub fn set_macro_factory(&mut self, factory: Box<dyn MacroFactory>) {
+    pub fn set_macro_factory(&mut self, mut factory: Box<dyn MacroFactory>) {
+        // Seed the factory's random series from the composition so every render
+        // starts from the same point and is reproducible.
+        factory.set_seed(self.composition.seed());
         self.factory = Some(factory);
     }
 
@@ -411,7 +414,13 @@ impl Engine {
             let owner_instance = self.macros[idx].instance;
             let owner_track = self.macros[idx].track;
             let settings = self.settings_for_instance(owner_instance);
-            let mut ctx = MacroCtx::new(self.tick, owner_track, self.composition.tpb(), settings);
+            let mut ctx = MacroCtx::new(
+                self.tick,
+                owner_track,
+                self.composition.tpb(),
+                self.composition.seed(),
+                settings,
+            );
             let wait = self.macros[idx].macro_.resume(&mut ctx);
             let actions = ctx.into_actions();
             results.push((seq, owner_instance, owner_track, wait, actions));

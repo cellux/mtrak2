@@ -18,7 +18,7 @@ use mtrak_midi::{MidiBackend, MidiError, OutputManager, PortInfo};
 use crate::chooser::{Chooser, ChooserKind};
 use crate::clipboard::{destination_edit, NibbleClipboard};
 use crate::code::CodeEditor;
-use crate::command::{self, Command, ScaleArgs};
+use crate::command::{self, Command, ScaleArgs, SeedArg};
 use crate::edit::{CellEdit, EVENT_NIBBLES, OFFSET_NIBBLES};
 use crate::key::{self, Action, Code, Key};
 use crate::line::LineEditor;
@@ -1909,9 +1909,26 @@ impl App {
                     .ok_or_else(|| "no MIDI backend".to_string())?;
                 midi.select(id).map_err(|e| e.to_string())?;
             }
+            Command::Seed(arg) => match arg {
+                SeedArg::Show => {
+                    self.set_message(
+                        format!("seed 0x{:016X}", self.project.composition.seed()),
+                        false,
+                    );
+                    return Ok(());
+                }
+                SeedArg::Set(value) => {
+                    self.project.composition.set_seed(value);
+                }
+                SeedArg::Random => {
+                    let seed = fresh_seed();
+                    self.project.composition.set_seed(seed);
+                    self.set_message(format!("seed 0x{seed:016X}"), false);
+                }
+            },
             Command::Help => {
                 self.set_message(
-                    "read write export bpm tpb lpb root scale mode rows tracks pattern port event follow"
+                    "read write export bpm tpb lpb root scale mode rows tracks pattern port event follow seed"
                         .to_string(),
                     false,
                 );
@@ -3050,6 +3067,25 @@ fn module_source(project: &mtrak_midi_io::TrackerProject, id: u8) -> Option<Stri
     project.modules.get(&id).cloned()
 }
 
+/// Draws a fresh seed from system entropy for `:seed random`.
+///
+/// This is the only place randomness enters the seed, and it runs on an explicit
+/// user command, so renders stay a pure function of the saved seed.
+fn fresh_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0);
+    // SplitMix64's finalizer, so seeds taken in the same nanosecond still differ.
+    let mut x = nanos ^ 0x9E37_79B9_7F4A_7C15;
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
 fn render_cell(event: &str, offset: Option<&str>, offsets_visible: bool) -> String {
     match (offsets_visible, offset) {
         (true, Some(offset)) => format!("{event}+{offset}"),
@@ -3667,6 +3703,28 @@ mod tests {
         app.handle_key(Key::new(Code::Enter));
         assert!(!app.follow_playhead());
         assert!(!app.is_dirty(), "following is only a view option");
+    }
+
+    #[test]
+    fn seed_command_sets_reports_and_rerolls() {
+        let mut app = app_with(4, 2);
+        assert_eq!(app.project.composition.seed(), 0, "fresh projects seed 0");
+
+        app.execute(Command::Seed(SeedArg::Set(0x1234))).unwrap();
+        assert_eq!(app.project.composition.seed(), 0x1234);
+        assert!(app.is_dirty(), "changing the seed is a project edit");
+
+        // Showing the seed reports it without mutating the project.
+        app.dirty = false;
+        app.execute(Command::Seed(SeedArg::Show)).unwrap();
+        let text = app.message().map(|m| m.text.clone()).unwrap_or_default();
+        assert!(text.contains("0000000000001234"), "{text}");
+        assert!(!app.is_dirty(), "showing the seed is not an edit");
+
+        // A fresh seed changes the value and reports it.
+        app.execute(Command::Seed(SeedArg::Random)).unwrap();
+        assert_ne!(app.project.composition.seed(), 0x1234);
+        assert!(app.is_dirty());
     }
 
     #[test]
