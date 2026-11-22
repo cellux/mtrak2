@@ -76,8 +76,8 @@ pub enum Command {
     PortSelect(usize),
     /// `:event BYTES` — a hex byte sequence for the current cell.
     Event(Vec<u8>),
-    /// `:follow` — toggle scrolling with the playhead.
-    Follow,
+    /// `:step N` — set the session-local recording step.
+    Step(u32),
     /// `:seed [VALUE|random]` — inspect or change the random seed.
     Seed(SeedArg),
     /// `:help`.
@@ -146,7 +146,7 @@ pub fn parse(input: &str) -> Result<Command, String> {
         "pattern" | "pat" => parse_pattern(&rest)?,
         "port" | "midi" => parse_port(&rest)?,
         "event" | "ev" => Command::Event(parse_event_bytes(&rest)?),
-        "follow" | "fol" => Command::Follow,
+        "step" => Command::Step(int_arg(&rest, "step")?),
         "seed" => {
             let raw = rest.first().map(|value| value.to_ascii_lowercase());
             match raw.as_deref() {
@@ -338,8 +338,11 @@ mod tests {
             Ok(Command::Read(Some("my songs/live set.mid".to_string()))),
             "file commands take the rest of the line as one path"
         );
-        assert_eq!(parse(":follow"), Ok(Command::Follow));
-        assert_eq!(parse(":fol"), Ok(Command::Follow));
+        assert_eq!(parse(":step 0"), Ok(Command::Step(0)));
+        assert_eq!(parse(":step 17"), Ok(Command::Step(17)));
+        assert!(parse(":step").is_err());
+        assert!(parse(":follow").is_err(), "follow was removed");
+        assert!(parse(":fol").is_err(), "follow was removed");
         assert_eq!(parse(":seed"), Ok(Command::Seed(SeedArg::Show)));
         assert_eq!(parse(":seed 42"), Ok(Command::Seed(SeedArg::Set(42))));
         assert_eq!(

@@ -467,7 +467,6 @@ impl Engine {
             SettingChange::Root(value) => target.root = value,
             SettingChange::Scale(mask) => target.scale = Scale::from_mask(mask),
             SettingChange::ModalDegree(value) => target.modal_degree = value,
-            SettingChange::ScaleAware(value) => target.scale_aware = value,
         }
     }
 

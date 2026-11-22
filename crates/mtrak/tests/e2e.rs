@@ -325,8 +325,8 @@ fn tui_session_edits_notes_and_commands_and_reloads() {
     app.handle_key(Key::new(Code::Enter));
     assert_eq!(app.project().composition.bpm(), Bpm::from_int(150).unwrap());
 
-    // Note entry: enter note mode and write a scale degree.
-    app.handle_key(Key::ctrl(Code::Char('n')));
+    // REC: note entry and step recording in the default chromatic scale.
+    app.handle_key(Key::ctrl(Code::Char('r')));
     app.handle_key(Key::ch('z'));
     assert_eq!(app.cell_display(0, 0).trim_end(), "903C64");
 

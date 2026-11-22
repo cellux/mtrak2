@@ -116,6 +116,9 @@ impl fmt::Debug for Scale {
     }
 }
 
+/// The all-twelve-semitone chromatic scale.
+pub const CHROMATIC_SCALE: Scale = Scale::from_mask(0x0FFF);
+
 /// A named scale definition (built-in or user).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ScaleDef {
@@ -129,6 +132,11 @@ pub struct ScaleDef {
 
 /// The built-in scales and their aliases (see `PLAN.md` §2.10).
 pub const BUILTIN_SCALES: &[ScaleDef] = &[
+    ScaleDef {
+        name: "chromatic",
+        aliases: &["chrom", "chr", "chromatic"],
+        mask: 0x0FFF,
+    },
     ScaleDef {
         name: "major",
         aliases: &["M", "major"],
@@ -244,8 +252,6 @@ pub struct Settings {
     pub scale: Scale,
     /// Modal degree within the scale.
     pub modal_degree: u8,
-    /// Whether note entry is scale-aware.
-    pub scale_aware: bool,
 }
 
 impl Default for Settings {
@@ -255,32 +261,34 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// The defaults for a new project (see `PLAN.md` §2.10).
+    /// The defaults for a new project (see `PLAN.md` §3.8).
     pub fn new() -> Self {
         Settings {
             root: 60,
-            scale: Scale::from_mask(0x0AB5),
+            scale: CHROMATIC_SCALE,
             modal_degree: 0,
-            scale_aware: true,
         }
+    }
+
+    /// Whether the selected scale is the built-in chromatic scale.
+    pub fn is_chromatic(&self) -> bool {
+        self.scale == CHROMATIC_SCALE
     }
 
     /// Converts a note-entry degree to a MIDI note, clamped to `0..=127`.
     ///
-    /// In scale-aware mode the degree indexes the (modal) scale; in chromatic
-    /// mode it is added directly to the root.
+    /// The degree indexes the selected (modal) scale. The chromatic scale's
+    /// intervals are the twelve semitones, so chromatic entry uses the same
+    /// path and simply adds the degree to the root.
     pub fn degree_to_note(&self, degree: u8) -> u8 {
-        let offset = if self.scale_aware {
-            let intervals = self.scale.mode_intervals(self.modal_degree);
-            if intervals.is_empty() {
-                return clamp_note(self.root as i32 + degree as i32);
-            }
+        let intervals = self.scale.mode_intervals(self.modal_degree);
+        let offset = if intervals.is_empty() {
+            degree as i32
+        } else {
             let k = intervals.len();
             let octave = (degree as usize) / k;
             let idx = (degree as usize) % k;
             (octave * 12 + intervals[idx] as usize) as i32
-        } else {
-            degree as i32
         };
         clamp_note(self.root as i32 + offset)
     }
@@ -392,22 +400,38 @@ mod tests {
     }
 
     #[test]
-    fn degree_to_note_in_scale_and_chromatic_modes() {
+    fn chromatic_is_a_builtin_scale_and_the_default() {
         let settings = Settings::new();
-        // C major, scale-aware: degrees 0..7 -> C D E F G A B C
-        assert_eq!(settings.degree_to_note(0), 60);
-        assert_eq!(settings.degree_to_note(1), 62);
-        assert_eq!(settings.degree_to_note(2), 64);
-        assert_eq!(settings.degree_to_note(3), 65);
-        assert_eq!(settings.degree_to_note(6), 71);
-        assert_eq!(settings.degree_to_note(7), 72);
+        assert_eq!(settings.scale, CHROMATIC_SCALE);
+        assert!(settings.is_chromatic());
+        assert_eq!(lookup_builtin("chromatic"), Some(CHROMATIC_SCALE));
+        assert_eq!(lookup_builtin("chrom"), Some(CHROMATIC_SCALE));
+        assert_eq!(
+            CHROMATIC_SCALE.pitch_classes(),
+            (0..12).collect::<Vec<u8>>()
+        );
+    }
 
-        let chromatic = Settings {
-            scale_aware: false,
+    #[test]
+    fn degree_to_note_in_scale_and_chromatic_modes() {
+        let major = Settings {
+            scale: lookup_builtin("major").unwrap(),
             ..Settings::new()
         };
+        // C major: degrees 0..7 -> C D E F G A B C
+        assert_eq!(major.degree_to_note(0), 60);
+        assert_eq!(major.degree_to_note(1), 62);
+        assert_eq!(major.degree_to_note(2), 64);
+        assert_eq!(major.degree_to_note(3), 65);
+        assert_eq!(major.degree_to_note(6), 71);
+        assert_eq!(major.degree_to_note(7), 72);
+
+        let chromatic = Settings::new();
+        assert!(chromatic.is_chromatic());
         assert_eq!(chromatic.degree_to_note(0), 60);
+        assert_eq!(chromatic.degree_to_note(1), 61);
         assert_eq!(chromatic.degree_to_note(4), 64);
+        assert_eq!(chromatic.degree_to_note(12), 72);
         assert_eq!(chromatic.degree_to_note(127), 127);
     }
 
@@ -415,7 +439,6 @@ mod tests {
     fn degree_to_note_clamps_at_127() {
         let settings = Settings {
             root: 120,
-            scale_aware: false,
             ..Settings::new()
         };
         assert_eq!(settings.degree_to_note(100), 127);

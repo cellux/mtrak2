@@ -192,16 +192,18 @@ pub enum Action {
     TogglePlay,
     /// Set the playback start row.
     SetStartRow,
+    /// Enter PLAY mode.
+    PlayMode,
+    /// Enter REC mode.
+    RecMode,
+    /// Enter EDIT mode.
+    EditMode,
+    /// Set the recording step (`Alt+0`..`Alt+9`).
+    SetRecordStep(u8),
     /// Enter command mode.
     CommandMode,
-    /// Toggle note-entry mode.
-    ToggleNoteMode,
-    /// Keep the playing row in view.
-    ToggleFollow,
     /// Silence every channel.
     AllNotesOff,
-    /// Toggle chromatic note entry.
-    ToggleChromatic,
     /// Undo.
     Undo,
     /// Redo.
@@ -222,6 +224,7 @@ pub fn lookup(key: Key) -> Option<Action> {
         match key.code {
             Enter => return Some(A::OpenChooser),
             Char('.') => return Some(A::AllNotesOff),
+            Char(c @ '0'..='9') => return Some(A::SetRecordStep(c as u8 - b'0')),
             _ => {}
         }
     }
@@ -261,13 +264,13 @@ pub fn lookup(key: Key) -> Option<Action> {
         (Char('c'), true, _) => A::Copy,
         (Char('v'), true, _) => A::Paste,
         (Char(' '), false, _) => A::TogglePlay,
-        (Char('s'), false, _) => A::SetStartRow,
+        (Char('S'), false, _) => A::SetStartRow,
         (Char(':'), false, _) => A::CommandMode,
-        (Char('n'), true, _) => A::ToggleNoteMode,
-        (Char('f'), true, _) => A::ToggleFollow,
-        (Char('N'), false, _) => A::ToggleChromatic,
+        (Char('p'), true, _) => A::PlayMode,
+        (Char('r'), true, _) => A::RecMode,
+        (Char('e'), true, _) => A::EditMode,
         (Char('z'), true, _) => A::Undo,
-        (Char('r'), true, _) => A::Redo,
+        (Char('y'), true, _) => A::Redo,
         (Char('s'), true, _) => A::Save,
         // Ctrl-Enter is indistinguishable from Enter in many terminals, so it
         // deliberately keeps the plain-Enter behavior.
@@ -314,19 +317,22 @@ mod tests {
         assert_eq!(lookup(Key::ch('.')), Some(Action::ClearBlock));
         assert_eq!(lookup(Key::ctrl(Code::Char('x'))), Some(Action::Cut));
         assert_eq!(lookup(Key::ch(' ')), Some(Action::TogglePlay));
-        assert_eq!(lookup(Key::ch('s')), Some(Action::SetStartRow));
+        assert_eq!(lookup(Key::ch('S')), Some(Action::SetStartRow));
+        assert_eq!(lookup(Key::ch('s')), None, "lowercase s is a piano key");
         assert_eq!(lookup(Key::ch(':')), Some(Action::CommandMode));
+        assert_eq!(lookup(Key::ctrl(Code::Char('p'))), Some(Action::PlayMode));
+        assert_eq!(lookup(Key::ctrl(Code::Char('r'))), Some(Action::RecMode));
+        assert_eq!(lookup(Key::ctrl(Code::Char('e'))), Some(Action::EditMode));
         assert_eq!(
-            lookup(Key::ctrl(Code::Char('n'))),
-            Some(Action::ToggleNoteMode)
+            lookup(Key::alt(Code::Char('0'))),
+            Some(Action::SetRecordStep(0))
         );
         assert_eq!(
-            lookup(Key::ctrl(Code::Char('f'))),
-            Some(Action::ToggleFollow)
+            lookup(Key::alt(Code::Char('9'))),
+            Some(Action::SetRecordStep(9))
         );
-        assert_eq!(lookup(Key::ch('N')), Some(Action::ToggleChromatic));
         assert_eq!(lookup(Key::ctrl(Code::Char('z'))), Some(Action::Undo));
-        assert_eq!(lookup(Key::ctrl(Code::Char('r'))), Some(Action::Redo));
+        assert_eq!(lookup(Key::ctrl(Code::Char('y'))), Some(Action::Redo));
         assert_eq!(lookup(Key::ctrl(Code::Char('s'))), Some(Action::Save));
         assert_eq!(lookup(Key::new(Code::Enter)), Some(Action::OpenEventEditor));
         assert_eq!(
@@ -338,9 +344,9 @@ mod tests {
     }
 
     #[test]
-    fn note_keys_and_unknown_keys_have_no_action() {
-        for c in ['z', 'x', 'c', 'v', 'b', 'n', 'm', ',', 'q', 'w', 'e'] {
-            assert_eq!(lookup(Key::ch(c)), None, "{c} is a note key");
-        }
+    fn removed_note_and_follow_bindings_have_no_action() {
+        assert_eq!(lookup(Key::ctrl(Code::Char('n'))), None);
+        assert_eq!(lookup(Key::ctrl(Code::Char('f'))), None);
+        assert_eq!(lookup(Key::ch('N')), None);
     }
 }

@@ -668,7 +668,6 @@ fn context_table(
     s.set("root", i64::from(settings.root))?;
     s.set("scale", i64::from(settings.scale.mask()))?;
     s.set("modal_degree", i64::from(settings.modal_degree))?;
-    s.set("scale_aware", settings.scale_aware)?;
     context.set("settings", s)?;
     Ok(context)
 }
@@ -723,7 +722,6 @@ fn read_setting(settings: Settings, name: &str) -> Value {
         "root" => Value::Integer(i64::from(settings.root)),
         "scale" => Value::Integer(i64::from(settings.scale.mask())),
         "modal_degree" | "mode" => Value::Integer(i64::from(settings.modal_degree)),
-        "scale_aware" => Value::Boolean(settings.scale_aware),
         _ => Value::Nil,
     }
 }
@@ -733,7 +731,6 @@ fn setting_change(name: &str, value: &Value) -> Option<SettingChange> {
         "root" => SettingChange::Root(value.as_integer()? as u8),
         "scale" => SettingChange::Scale(value.as_integer()? as u16),
         "modal_degree" | "mode" => SettingChange::ModalDegree(value.as_integer()? as u8),
-        "scale_aware" => SettingChange::ScaleAware(value.as_boolean()?),
         _ => return None,
     })
 }
@@ -744,7 +741,6 @@ pub fn apply_change(settings: &mut Settings, change: &SettingChange) {
         SettingChange::Root(value) => settings.root = *value,
         SettingChange::Scale(mask) => settings.scale = Scale::from_mask(*mask),
         SettingChange::ModalDegree(value) => settings.modal_degree = *value,
-        SettingChange::ScaleAware(value) => settings.scale_aware = *value,
     }
 }
 
@@ -1124,6 +1120,13 @@ mod tests {
             .unwrap();
         let engine = run(pattern_with_macro(0x46, 0, 0), &runtime);
         assert_eq!(notes(&engine), vec![(0, 0, 62)]);
+    }
+
+    #[test]
+    fn scale_aware_is_no_longer_a_setting() {
+        let settings = Settings::new();
+        assert!(matches!(read_setting(settings, "scale_aware"), Value::Nil));
+        assert!(setting_change("scale_aware", &Value::Boolean(true)).is_none());
     }
 
     #[test]

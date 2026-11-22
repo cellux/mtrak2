@@ -38,14 +38,42 @@ pub enum Screen {
 /// The mode the editor is in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
-    /// Normal editing.
-    Normal,
-    /// Note entry.
-    Note,
+    /// Play notes without changing pattern data.
+    Play,
+    /// Play notes and record them into the selected track.
+    Rec,
+    /// Edit pattern cells nibble by nibble.
+    Edit,
     /// The colon command prompt.
     Command,
     /// The pattern/module chooser.
     Chooser,
+}
+
+impl Mode {
+    /// Whether this musical mode follows the playhead.
+    pub fn follows_playback(self) -> bool {
+        matches!(self, Mode::Play | Mode::Rec)
+    }
+
+    /// Whether this musical mode allows pattern editing.
+    pub fn is_editing(self) -> bool {
+        self == Mode::Edit
+    }
+
+    /// Whether this is a musical (not transient UI) mode.
+    pub fn is_musical(self) -> bool {
+        matches!(self, Mode::Play | Mode::Rec | Mode::Edit)
+    }
+}
+
+/// Playback position captured while command mode pauses the transport.
+#[derive(Clone, Debug)]
+struct PlaybackPause {
+    tick: u64,
+    micros: f64,
+    start_row: usize,
+    current_row: usize,
 }
 
 /// A single-line status message.
@@ -303,7 +331,7 @@ pub struct App {
     edit_recorded: bool,
     clipboard: NibbleClipboard,
     offsets_visible: bool,
-    follow_playhead: bool,
+    record_step: u8,
     pattern_undo: HashMap<PatternId, UndoStack<Pattern>>,
     pattern_struct_undo: UndoStack<Composition>,
 
@@ -313,7 +341,6 @@ pub struct App {
     code_scroll: usize,
     module_undo: HashMap<u8, UndoStack<String>>,
     code_struct_undo: UndoStack<BTreeMap<u8, String>>,
-    note_chromatic: bool,
 
     // Chooser.
     chooser: Option<Chooser>,
@@ -342,6 +369,8 @@ pub struct App {
     /// Absolute tick where the pattern ends; playback stops there even if the
     /// last rows contain no events.
     play_end_tick: u64,
+    /// Playback captured while command mode pauses the transport.
+    command_pause: Option<PlaybackPause>,
 }
 
 impl App {
@@ -353,8 +382,8 @@ impl App {
         App {
             project,
             screen: Screen::Pattern,
-            mode: Mode::Normal,
-            previous_mode: Mode::Normal,
+            mode: Mode::Play,
+            previous_mode: Mode::Play,
             message: None,
             input: LineEditor::new(),
             command_failed: false,
@@ -370,7 +399,7 @@ impl App {
             edit_recorded: false,
             clipboard: NibbleClipboard::default(),
             offsets_visible: false,
-            follow_playhead: false,
+            record_step: 1,
             pattern_undo: HashMap::new(),
             pattern_struct_undo: UndoStack::new(64),
             module_id,
@@ -378,7 +407,6 @@ impl App {
             code_scroll: 0,
             module_undo: HashMap::new(),
             code_struct_undo: UndoStack::new(64),
-            note_chromatic: false,
             chooser: None,
             chooser_clipboard: None,
             midi: None,
@@ -397,6 +425,7 @@ impl App {
             play_start_row: 0,
             play_current_row: 0,
             play_end_tick: 0,
+            command_pause: None,
         }
     }
 
@@ -542,14 +571,19 @@ impl App {
         self.offsets_visible
     }
 
-    /// Whether the pattern view scrolls with the playing row.
-    pub fn follow_playhead(&self) -> bool {
-        self.follow_playhead
+    /// Whether the current musical mode follows the playhead.
+    pub fn follows_playhead(&self) -> bool {
+        self.mode.follows_playback()
     }
 
-    /// Toggles whether the pattern view follows the playhead.
-    pub fn toggle_follow(&mut self) {
-        self.follow_playhead = !self.follow_playhead;
+    /// The session-local recording step in rows.
+    pub fn recording_step(&self) -> u8 {
+        self.record_step
+    }
+
+    /// Sets the session-local recording step.
+    pub fn set_record_step(&mut self, step: u8) {
+        self.record_step = step;
     }
 
     /// The grid cursor as `(row, track, nibble)`.
@@ -572,9 +606,9 @@ impl App {
         self.selection
     }
 
-    /// Whether note entry is chromatic.
+    /// Whether the selected scale is chromatic.
     pub fn note_chromatic(&self) -> bool {
-        self.note_chromatic
+        self.effective_settings().is_chromatic()
     }
 
     fn pattern_geometry(&self) -> (usize, usize) {
@@ -791,15 +825,25 @@ impl App {
                     .unwrap_or(1),
             );
         let (rows, tracks) = self.pattern_geometry();
+        let editing = self.mode.is_editing();
         match action {
             Action::MoveLeft => {
                 self.cancel_selection();
-                self.move_left();
+                if self.mode.follows_playback() {
+                    // PLAY/REC navigate whole tracks and keep the nibble.
+                    self.track = self.track.saturating_sub(1);
+                } else {
+                    self.move_left();
+                }
                 self.sync_edit();
             }
             Action::MoveRight => {
                 self.cancel_selection();
-                self.move_right();
+                if self.mode.follows_playback() {
+                    self.track = (self.track + 1).min(tracks.saturating_sub(1));
+                } else {
+                    self.move_right();
+                }
                 self.sync_edit();
             }
             Action::MoveUp => {
@@ -856,52 +900,105 @@ impl App {
                 self.track = self.track.saturating_sub(1);
                 self.sync_edit();
             }
-            Action::TrackInsert => self.insert_track(),
-            Action::TrackDelete => self.delete_track(),
+            Action::TrackInsert => {
+                if editing {
+                    self.insert_track();
+                }
+            }
+            Action::TrackDelete => {
+                if editing {
+                    self.delete_track();
+                }
+            }
             Action::BrushWider => {
-                self.cancel_selection();
-                self.brush_width = self.brush_width.grow(self.offsets_visible);
+                if editing {
+                    self.cancel_selection();
+                    self.brush_width = self.brush_width.grow(self.offsets_visible);
+                }
             }
             Action::BrushNarrower => {
-                self.cancel_selection();
-                self.brush_width = self.brush_width.shrink(self.offsets_visible);
+                if editing {
+                    self.cancel_selection();
+                    self.brush_width = self.brush_width.shrink(self.offsets_visible);
+                }
             }
             Action::BrushTaller => {
-                self.cancel_selection();
-                self.brush_height = self.brush_height.grow();
+                if editing {
+                    self.cancel_selection();
+                    self.brush_height = self.brush_height.grow();
+                }
             }
             Action::BrushShorter => {
-                self.cancel_selection();
-                self.brush_height = self.brush_height.shrink();
+                if editing {
+                    self.cancel_selection();
+                    self.brush_height = self.brush_height.shrink();
+                }
             }
-            Action::SelectLeft => self.extend_selection(-1, 0),
-            Action::SelectRight => self.extend_selection(1, 0),
-            Action::SelectUp => self.extend_selection(0, -1),
-            Action::SelectDown => self.extend_selection(0, 1),
-            Action::InsertBlock => self.insert_block(),
-            Action::DeleteBlock => self.delete_block(),
-            Action::BackspaceBlock => self.backspace_block(),
-            Action::ClearBlock => self.clear_block(),
+            Action::SelectLeft | Action::SelectRight | Action::SelectUp | Action::SelectDown => {
+                if editing {
+                    match action {
+                        Action::SelectLeft => self.extend_selection(-1, 0),
+                        Action::SelectRight => self.extend_selection(1, 0),
+                        Action::SelectUp => self.extend_selection(0, -1),
+                        _ => self.extend_selection(0, 1),
+                    }
+                }
+            }
+            Action::InsertBlock => {
+                if editing {
+                    self.insert_block();
+                }
+            }
+            Action::DeleteBlock => {
+                if editing {
+                    self.delete_block();
+                }
+            }
+            Action::BackspaceBlock => {
+                if editing {
+                    self.backspace_block();
+                }
+            }
+            Action::ClearBlock => {
+                if editing {
+                    self.clear_block();
+                }
+            }
             Action::CancelSelection => self.cancel_selection(),
-            Action::Cut => self.cut(),
-            Action::Copy => self.copy(),
-            Action::Paste => self.paste(),
-            Action::ToggleOffsets => self.toggle_offsets(),
-            Action::ToggleFollow => self.toggle_follow(),
+            Action::Cut => {
+                if editing {
+                    self.cut();
+                }
+            }
+            Action::Copy => {
+                if editing {
+                    self.copy();
+                }
+            }
+            Action::Paste => {
+                if editing {
+                    self.paste();
+                }
+            }
+            Action::ToggleOffsets => {
+                if editing {
+                    self.toggle_offsets();
+                }
+            }
             Action::TogglePlay => self.toggle_playback(),
             Action::SetStartRow => self.play_start_row = self.row,
+            Action::SetRecordStep(step) => self.record_step = step,
             Action::CommandMode => self.enter_command_mode(),
-            Action::ToggleNoteMode => {
-                self.mode = if self.mode == Mode::Note {
-                    Mode::Normal
-                } else {
-                    Mode::Note
-                };
-            }
-            Action::ToggleChromatic => self.note_chromatic = !self.note_chromatic,
+            Action::PlayMode => self.set_mode(Mode::Play),
+            Action::RecMode => self.set_mode(Mode::Rec),
+            Action::EditMode => self.set_mode(Mode::Edit),
             Action::Undo => self.undo(),
             Action::Redo => self.redo(),
-            Action::OpenEventEditor => self.open_event_command(),
+            Action::OpenEventEditor => {
+                if editing {
+                    self.open_event_command();
+                }
+            }
             Action::HelpScreen
             | Action::PatternScreen
             | Action::CodeScreen
@@ -910,6 +1007,10 @@ impl App {
             | Action::Quit
             | Action::Save
             | Action::AllNotesOff => {}
+        }
+        if self.mode.follows_playback() && self.playing {
+            self.row = self.play_current_row.min(rows.saturating_sub(1));
+            self.selection = None;
         }
     }
 
@@ -1034,6 +1135,9 @@ impl App {
             self.commit_edit(edit);
         }
         self.edit_recorded = false;
+        if !self.mode.is_editing() {
+            return;
+        }
         let (row, track) = (self.row, self.track);
         let Some(slot) = self.pattern().slot(row, track) else {
             return;
@@ -1558,29 +1662,54 @@ impl App {
 
     // --- Note entry -----------------------------------------------------------
 
-    /// Handles a key in note mode, returning whether it was consumed.
+    /// Handles a note key in PLAY or REC, returning whether it was consumed.
     pub fn note_key(&mut self, c: char) -> bool {
-        let mapping = if self.note_chromatic {
+        match self.mode {
+            Mode::Play => {
+                let Some(note) = self.note_for_key(c) else {
+                    return false;
+                };
+                let (channel, velocity) = self.note_defaults();
+                self.audition(note, channel, velocity);
+                true
+            }
+            Mode::Rec => {
+                let Some(note) = self.note_for_key(c) else {
+                    return false;
+                };
+                let (channel, velocity) = self.note_defaults();
+                // Send first so live recording cannot be delayed by the
+                // future-stream rebuild.
+                self.audition(note, channel, velocity);
+                if self.playing {
+                    self.record_live(note, channel, velocity);
+                } else {
+                    self.record_step(note, channel, velocity);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Resolves a keyboard character to a MIDI note in the selected scale.
+    fn note_for_key(&self, c: char) -> Option<u8> {
+        let settings = self.effective_settings();
+        let mapping = if settings.is_chromatic() {
             chromatic_map()
         } else {
             scale_map()
         };
-        let Some(degree) = mapping
+        mapping
             .iter()
             .find(|(key, _)| *key == c)
-            .map(|(_, degree)| *degree)
-        else {
-            return false;
-        };
-        let mut settings = self.effective_settings();
-        settings.scale_aware = !self.note_chromatic;
-        let note = settings.degree_to_note(degree);
-        self.sync_edit();
-        // Inherit the channel and velocity already present in this cell.
-        let (channel, velocity) = self.note_defaults();
+            .map(|(_, degree)| settings.degree_to_note(*degree))
+    }
+
+    /// Writes one stopped-REC note and advances by the recording step.
+    fn record_step(&mut self, note: u8, channel: u8, velocity: u8) {
+        let (rows, _) = self.pattern_geometry();
         self.record_pattern();
-        // Note entry replaces the cell wholesale; drop the temporary buffer so
-        // it cannot finalize over the event we are about to write.
         self.edit = None;
         self.edit_recorded = false;
         let event = Event::Channel(ChannelMessage::with_data(
@@ -1589,34 +1718,103 @@ impl App {
             note,
             Some(velocity),
         ));
-        if let Some(pattern) = self.project.composition.pattern_mut(self.current) {
-            pattern.set_event(self.row, self.track, event);
+        if let Some(slot) = self
+            .project
+            .composition
+            .pattern_mut(self.current)
+            .and_then(|pattern| pattern.slot_mut(self.row, self.track))
+        {
+            slot.event = event;
+            slot.offset = 0;
         }
-        self.audition(note, channel, velocity);
-        let (rows, _) = self.pattern_geometry();
-        self.row = (self.row + 1).min(rows.saturating_sub(1));
-        self.sync_edit();
-        true
+        self.dirty = true;
+        self.row = self
+            .row
+            .saturating_add(usize::from(self.record_step))
+            .min(rows.saturating_sub(1));
     }
 
-    /// The channel and velocity a new note inherits from the current cell.
+    /// Writes one live-REC note at the current playhead position.
+    fn record_live(&mut self, note: u8, channel: u8, velocity: u8) {
+        let (rows, _) = self.pattern_geometry();
+        let row = self.play_current_row.min(rows.saturating_sub(1));
+        let row_len = row_ticks(self.project.composition.tpb(), self.pattern().lpb()).unwrap_or(1);
+        let row_start = row as u64 * row_len as u64;
+        let offset = self.play_tick.saturating_sub(row_start).min(row_len as u64) as u32;
+        self.row = row;
+        self.record_pattern();
+        self.edit = None;
+        self.edit_recorded = false;
+        let event = Event::Channel(ChannelMessage::with_data(
+            ChannelKind::NoteOn,
+            channel,
+            note,
+            Some(velocity),
+        ));
+        if let Some(slot) = self
+            .project
+            .composition
+            .pattern_mut(self.current)
+            .and_then(|pattern| pattern.slot_mut(row, self.track))
+        {
+            slot.event = event;
+            slot.offset = offset;
+        }
+        self.dirty = true;
+        self.rebuild_future_stream();
+    }
+
+    /// Discards the not-yet-emitted tail and re-renders from the current tick.
     ///
-    /// A channel-voice event supplies its channel; a note-on/note-off also
-    /// supplies its velocity. Missing parts fall back to channel 0 and
-    /// velocity 100.
+    /// Every event at or before `play_tick` has already been sent, so the
+    /// rebuilt stream starts strictly after it. This removes replaced pending
+    /// events and macro-generated descendants, and never resends the note that
+    /// live recording just auditioned.
+    fn rebuild_future_stream(&mut self) {
+        if !self.playing {
+            return;
+        }
+        let events = self.render();
+        self.play_next = events
+            .iter()
+            .position(|event| event.tick > self.play_tick)
+            .unwrap_or(events.len());
+        self.play_events = events;
+    }
+
+    /// The channel and velocity a new note inherits.
+    ///
+    /// Each value is found independently by scanning the selected track from
+    /// the current row toward earlier rows. A channel-voice event supplies its
+    /// channel; a note-on/note-off also supplies its velocity. Missing parts
+    /// fall back to channel 0 and velocity 100.
     fn note_defaults(&self) -> (u8, u8) {
         let mut channel = 0;
         let mut velocity = 100;
-        if let Some(slot) = self.pattern().slot(self.row, self.track) {
-            if let Event::Channel(message) = &slot.event {
+        let mut channel_found = false;
+        let mut velocity_found = false;
+        for row in (0..=self.row).rev() {
+            let Some(slot) = self.pattern().slot(row, self.track) else {
+                continue;
+            };
+            let Event::Channel(message) = &slot.event else {
+                continue;
+            };
+            if !channel_found {
                 if let Some(value) = message.channel {
                     channel = value;
+                    channel_found = true;
                 }
-                if matches!(message.kind, ChannelKind::NoteOn | ChannelKind::NoteOff) {
-                    if let Some(value) = message.data2 {
-                        velocity = value;
-                    }
+            }
+            if !velocity_found && matches!(message.kind, ChannelKind::NoteOn | ChannelKind::NoteOff)
+            {
+                if let Some(value) = message.data2 {
+                    velocity = value;
+                    velocity_found = true;
                 }
+            }
+            if channel_found && velocity_found {
+                break;
             }
         }
         (channel, velocity)
@@ -1690,6 +1888,9 @@ impl App {
                 *slot = previous;
             }
             self.after_pattern_change();
+            if self.playing {
+                self.rebuild_future_stream();
+            }
         }
     }
 
@@ -1706,6 +1907,9 @@ impl App {
                 *slot = next;
             }
             self.after_pattern_change();
+            if self.playing {
+                self.rebuild_future_stream();
+            }
         }
     }
 
@@ -1754,16 +1958,77 @@ impl App {
 
     // --- Command layer --------------------------------------------------------
 
-    fn enter_command_mode(&mut self) {
-        self.previous_mode = if self.mode == Mode::Note {
-            Mode::Normal
-        } else {
-            self.mode
+    // --- Modes and playback pause --------------------------------------------
+
+    /// Switches to a musical or transient mode.
+    ///
+    /// An active cell edit is finalized exactly once. PLAY/REC drop selection
+    /// state they cannot use and snap the cursor row to the playhead while
+    /// playback runs; EDIT recreates the edit buffer at the preserved cursor.
+    pub fn set_mode(&mut self, mode: Mode) {
+        if let Some(edit) = self.edit.take() {
+            self.commit_edit(edit);
+        }
+        self.edit_recorded = false;
+        if mode.follows_playback() {
+            self.selection = None;
+        }
+        self.mode = mode;
+        if mode.follows_playback() && self.playing {
+            let (rows, _) = self.pattern_geometry();
+            self.row = self.play_current_row.min(rows.saturating_sub(1));
+        }
+    }
+
+    /// Pauses playback for command mode, preserving its exact position.
+    fn pause_for_command(&mut self) {
+        if !self.playing {
+            return;
+        }
+        self.all_notes_off();
+        self.command_pause = Some(PlaybackPause {
+            tick: self.play_tick,
+            micros: self.play_micros,
+            start_row: self.play_start_row,
+            current_row: self.play_current_row,
+        });
+        self.playing = false;
+    }
+
+    /// Restores the paused playback position and rebuilds the future stream.
+    fn resume_after_command(&mut self) {
+        let Some(paused) = self.command_pause.take() else {
+            return;
         };
-        self.mode = Mode::Command;
+        self.play_tick = paused.tick;
+        self.play_micros = paused.micros;
+        self.play_start_row = paused.start_row;
+        self.play_current_row = paused.current_row;
+        let tpb = self.project.composition.tpb();
+        let row_len = row_ticks(tpb, self.pattern().lpb()).unwrap_or(1) as u64;
+        self.play_end_tick = self.pattern().row_count() as u64 * row_len;
+        let events = self.render();
+        self.play_next = events
+            .iter()
+            .position(|event| event.tick > self.play_tick)
+            .unwrap_or(events.len());
+        self.play_events = events;
+        self.playing = true;
+        if self.mode.follows_playback() {
+            let (rows, _) = self.pattern_geometry();
+            self.row = self.play_current_row.min(rows.saturating_sub(1));
+        }
+    }
+
+    fn enter_command_mode(&mut self) {
+        if self.mode.is_musical() {
+            self.previous_mode = self.mode;
+        }
         self.command_failed = false;
         self.path_completion = None;
         self.input.clear();
+        self.set_mode(Mode::Command);
+        self.pause_for_command();
     }
 
     fn open_event_command(&mut self) {
@@ -1786,13 +2051,16 @@ impl App {
         // The status line draws the leading colon, so the buffer holds the
         // command body only.
         let text = format!("event {hex}");
-        self.previous_mode = self.mode;
-        self.mode = Mode::Command;
+        if self.mode.is_musical() {
+            self.previous_mode = self.mode;
+        }
         self.command_failed = false;
         self.path_completion = None;
         self.input = LineEditor::from_text(&text);
         // Place the cursor on the first event nibble (after "event ").
         self.input.set_cursor("event ".len());
+        self.set_mode(Mode::Command);
+        self.pause_for_command();
     }
 
     /// Executes a parsed command.
@@ -1802,8 +2070,9 @@ impl App {
             Command::Write(path) => return self.save(path),
             Command::Export(path) => return self.export(path),
             Command::Event(bytes) => return self.commit_event_bytes(&bytes),
-            Command::Follow => {
-                self.toggle_follow();
+            Command::Step(value) => {
+                self.record_step = u8::try_from(value)
+                    .map_err(|_| format!("recording step is too large: {value}"))?;
                 return Ok(());
             }
             Command::Bpm(value) => {
@@ -1928,7 +2197,7 @@ impl App {
             },
             Command::Help => {
                 self.set_message(
-                    "read write export bpm tpb lpb root scale mode rows tracks pattern port event follow seed"
+                    "read write export bpm tpb lpb root scale mode rows tracks pattern port event step seed"
                         .to_string(),
                     false,
                 );
@@ -2068,8 +2337,8 @@ impl App {
             Ok(command) => match self.execute(command) {
                 Ok(()) => {
                     self.command_failed = false;
-                    self.mode = self.previous_mode;
                     self.input.clear();
+                    self.restore_previous_mode();
                 }
                 Err(error) => {
                     self.command_failed = true;
@@ -2107,16 +2376,18 @@ impl App {
             Screen::Code => ChooserKind::Code,
             Screen::Help => return,
         };
-        if self.screen == Screen::Pattern {
-            self.sync_edit();
+        if self.screen == Screen::Help {
+            return;
+        }
+        if self.mode.is_musical() {
+            self.previous_mode = self.mode;
         }
         let cursor = match kind {
             ChooserKind::Pattern => self.current.value(),
             ChooserKind::Code => self.module_id,
         };
-        self.previous_mode = self.mode;
+        self.set_mode(Mode::Chooser);
         self.chooser = Some(Chooser::new(kind, cursor));
-        self.mode = Mode::Chooser;
     }
 
     /// The open chooser, if any.
@@ -2177,7 +2448,7 @@ impl App {
         let Some(chooser) = self.chooser.take() else {
             return;
         };
-        self.mode = self.previous_mode;
+        self.set_mode(self.previous_mode);
         let id = chooser.cursor;
         match chooser.kind {
             ChooserKind::Pattern => {
@@ -2544,6 +2815,11 @@ impl App {
         self.play_events = events;
         self.play_micros = 0.0;
         self.playing = true;
+        if self.mode.follows_playback() {
+            self.row = self
+                .play_start_row
+                .min(self.pattern().row_count().saturating_sub(1));
+        }
     }
 
     /// Clears playback state without touching the synth.
@@ -2553,10 +2829,17 @@ impl App {
     /// releases notes — see [`Self::tick_playback`] and
     /// [`Self::stop_playback_and_release`].
     pub fn stop_playback(&mut self) {
+        let follow = self.mode.follows_playback();
+        let (rows, _) = self.pattern_geometry();
+        let stopping_row = self.play_current_row.min(rows.saturating_sub(1));
         self.playing = false;
         self.play_events.clear();
         self.play_next = 0;
         self.play_end_tick = 0;
+        if follow {
+            self.row = stopping_row;
+            self.selection = None;
+        }
     }
 
     /// Whether another pattern is still sounding when this one ends.
@@ -2657,6 +2940,10 @@ impl App {
         }
         let row_len = row_ticks(tpb, self.pattern().lpb()).unwrap_or(1) as u64;
         self.play_current_row = (self.play_tick / row_len) as usize;
+        if self.mode.follows_playback() {
+            let (rows, _) = self.pattern_geometry();
+            self.row = self.play_current_row.min(rows.saturating_sub(1));
+        }
         // Stop at the end of the pattern, not when the last event has been
         // sent: trailing empty rows still belong to the pattern. A longer child
         // pattern would keep playing past this point, so only release when
@@ -2674,6 +2961,10 @@ impl App {
         // Silence is a panic button: available in every workspace and mode.
         if key.alt && key.code == Code::Char('.') {
             return self.all_notes_off();
+        }
+        // Esc stops active playback before any context-sensitive cancel.
+        if key.code == Code::Esc && !key.ctrl && !key.alt && !key.shift && self.playing {
+            return self.stop_playback_and_release();
         }
         match self.mode {
             Mode::Command => return self.handle_command_key(key),
@@ -2701,7 +2992,7 @@ impl App {
     }
 
     fn handle_pattern_key(&mut self, key: Key) {
-        if self.mode == Mode::Note {
+        if matches!(self.mode, Mode::Play | Mode::Rec) {
             if let Code::Char(c) = key.code {
                 if !key.ctrl && !key.alt && self.note_key(c) {
                     return;
@@ -2710,14 +3001,14 @@ impl App {
         }
         // Backspace edits nibbles left of the cursor before falling back to
         // the structural block deletion.
-        if key == Key::new(Code::Backspace) && self.backspace_nibble() {
+        if self.mode.is_editing() && key == Key::new(Code::Backspace) && self.backspace_nibble() {
             return;
         }
         if let Some(action) = key::lookup(key) {
             self.apply(action);
             return;
         }
-        if self.mode == Mode::Normal {
+        if self.mode.is_editing() {
             if let Code::Char(c) = key.code {
                 if !key.ctrl && !key.alt {
                     if let Some(value) = c.to_digit(16) {
@@ -2731,7 +3022,7 @@ impl App {
     fn handle_code_key(&mut self, key: Key) {
         match key.code {
             Code::Char('z') if key.ctrl => self.undo_module(),
-            Code::Char('r') if key.ctrl => self.redo_module(),
+            Code::Char('y') if key.ctrl => self.redo_module(),
             Code::Char('s') if key.ctrl => self.apply(Action::Save),
             Code::Enter if key.alt => self.open_chooser(),
             Code::Function(5) => self.reload_lua(),
@@ -2917,12 +3208,19 @@ impl App {
         self.replace_input_range(completion.start, completion.end, &value);
     }
 
+    /// Restores the musical mode that was active before a transient mode.
+    fn restore_previous_mode(&mut self) {
+        let previous = self.previous_mode;
+        self.set_mode(previous);
+        self.resume_after_command();
+    }
+
     /// Abandons the command line and returns to the previous mode.
     fn cancel_command(&mut self) {
         self.input.clear();
         self.path_completion = None;
         self.command_failed = false;
-        self.mode = self.previous_mode;
+        self.restore_previous_mode();
     }
 
     fn handle_chooser_key(&mut self, key: Key) {
@@ -2932,14 +3230,14 @@ impl App {
                 Code::Char('x') => return self.chooser_cut(),
                 Code::Char('v') => return self.chooser_paste(),
                 Code::Char('z') => return self.chooser_undo(),
-                Code::Char('r') => return self.chooser_redo(),
+                Code::Char('y') => return self.chooser_redo(),
                 _ => {}
             }
         }
         match key.code {
             Code::Esc => {
                 self.chooser = None;
-                self.mode = self.previous_mode;
+                self.set_mode(self.previous_mode);
             }
             Code::Enter => self.accept_chooser(),
             Code::Left => self.move_chooser(-1, 0),
@@ -3152,7 +3450,10 @@ mod tests {
             pattern.resize_rows(rows).unwrap();
             pattern.resize_tracks(tracks).unwrap();
         }
-        App::new(project)
+        let mut app = App::new(project);
+        // Most tests exercise the editor; action/mode tests switch explicitly.
+        app.set_mode(Mode::Edit);
+        app
     }
 
     fn note(key: u8, velocity: u8) -> Event {
@@ -3395,7 +3696,7 @@ mod tests {
         app.handle_key(Key::ch(':'));
         type_hex(&mut app, "event 90 64 3F");
         app.handle_key(Key::new(Code::Enter));
-        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.mode(), Mode::Edit);
         assert_eq!(slot_event(&app, 0, 0), note(0x64, 0x3F));
     }
 
@@ -3536,7 +3837,7 @@ mod tests {
 
         // Ctrl-C abandons the command.
         app.handle_key(Key::ctrl(Code::Char('c')));
-        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.mode(), Mode::Edit);
         assert!(app.input_text().is_empty());
     }
 
@@ -3546,7 +3847,7 @@ mod tests {
         app.handle_key(Key::ch(':'));
         assert_eq!(app.mode(), Mode::Command);
         app.handle_key(Key::ctrl(Code::Char('d')));
-        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.mode(), Mode::Edit);
 
         // With text, Ctrl-D deletes the character at the cursor instead.
         app.handle_key(Key::ch(':'));
@@ -3693,16 +3994,16 @@ mod tests {
     }
 
     #[test]
-    fn follow_toggles_with_ctrl_f_and_the_command() {
+    fn record_step_is_session_local_and_set_by_alt_digits_and_the_command() {
         let mut app = app_with(8, 2);
-        assert!(!app.follow_playhead());
-        app.handle_key(Key::ctrl(Code::Char('f')));
-        assert!(app.follow_playhead());
+        assert_eq!(app.recording_step(), 1);
+        app.handle_key(Key::alt(Code::Char('3')));
+        assert_eq!(app.recording_step(), 3);
         app.handle_key(Key::ch(':'));
-        type_hex(&mut app, "follow");
+        type_hex(&mut app, "step 17");
         app.handle_key(Key::new(Code::Enter));
-        assert!(!app.follow_playhead());
-        assert!(!app.is_dirty(), "following is only a view option");
+        assert_eq!(app.recording_step(), 17);
+        assert_eq!(app.mode(), Mode::Edit);
     }
 
     #[test]
@@ -3792,7 +4093,7 @@ mod tests {
             app.handle_key(Key::ch(c));
         }
         app.handle_key(Key::new(Code::Enter));
-        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.mode(), Mode::Edit);
         assert_eq!(app.current_pattern(), PatternId(0x4F));
         assert!(app.pattern_exists(0x4F));
     }
@@ -3805,7 +4106,7 @@ mod tests {
             app.handle_key(Key::ch(c));
         }
         app.handle_key(Key::new(Code::Esc));
-        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.mode(), Mode::Edit);
         assert_eq!(app.current_pattern(), PatternId(0));
         assert!(!app.pattern_exists(0x10));
     }
@@ -4028,9 +4329,488 @@ mod tests {
     #[test]
     fn note_entry_uses_global_settings() {
         let mut app = app_with(8, 1);
-        app.apply(Action::ToggleNoteMode);
+        app.handle_key(Key::ctrl(Code::Char('r')));
+        assert_eq!(app.mode(), Mode::Rec);
         app.handle_key(Key::ch('z'));
         assert_eq!(slot_event(&app, 0, 0), note(60, 100));
+        assert_eq!(app.cursor().0, 1, "REC advances by the recording step");
+    }
+
+    #[test]
+    fn rec_step_advances_by_the_configured_step_and_clamps() {
+        let mut app = app_with(4, 1);
+        app.handle_key(Key::ctrl(Code::Char('r')));
+        app.handle_key(Key::alt(Code::Char('2')));
+        app.handle_key(Key::ch('z'));
+        assert_eq!(app.cursor().0, 2);
+        assert_eq!(slot_event(&app, 0, 0), note(60, 100));
+        app.handle_key(Key::ch('x'));
+        assert_eq!(app.cursor().0, 3, "clamped at the final row");
+        assert_eq!(slot_event(&app, 2, 0), note(62, 100));
+
+        // Step 0 leaves the row unchanged and replaces the same cell.
+        app.handle_key(Key::alt(Code::Char('0')));
+        app.handle_key(Key::ch('c'));
+        assert_eq!(app.cursor().0, 3);
+        assert_eq!(slot_event(&app, 3, 0), note(64, 100));
+        app.handle_key(Key::ch('d'));
+        assert_eq!(app.cursor().0, 3);
+        assert_eq!(slot_event(&app, 3, 0), note(63, 100));
+    }
+
+    #[test]
+    fn each_recorded_note_is_one_independent_undo_step() {
+        let mut app = app_with(4, 1);
+        app.handle_key(Key::ctrl(Code::Char('r')));
+        app.handle_key(Key::ch('z'));
+        app.handle_key(Key::ch('x'));
+        assert_eq!(slot_event(&app, 0, 0), note(60, 100));
+        assert_eq!(slot_event(&app, 1, 0), note(62, 100));
+        app.handle_key(Key::ctrl(Code::Char('z')));
+        assert_eq!(slot_event(&app, 1, 0), Event::Empty);
+        assert_eq!(slot_event(&app, 0, 0), note(60, 100));
+        app.handle_key(Key::ctrl(Code::Char('z')));
+        assert_eq!(slot_event(&app, 0, 0), Event::Empty);
+        app.handle_key(Key::ctrl(Code::Char('y')));
+        assert_eq!(slot_event(&app, 0, 0), note(60, 100));
+    }
+
+    #[test]
+    fn play_auditions_without_mutating_or_advancing() {
+        let mut app = app_with(8, 1);
+        let backend = MockBackend::new(&["out"]);
+        let sent = backend.sent_handle();
+        let mut manager = OutputManager::new(Box::new(backend) as Box<dyn MidiBackend>);
+        manager.select(0).unwrap();
+        app.set_midi(manager);
+
+        assert_eq!(app.mode(), Mode::Edit);
+        app.handle_key(Key::ctrl(Code::Char('p')));
+        assert_eq!(app.mode(), Mode::Play);
+        app.handle_key(Key::ch('z'));
+        assert_eq!(sent.borrow().as_slice(), &[vec![0x90, 60, 100]]);
+        assert_eq!(app.cursor(), (0, 0, 0));
+        assert!(slot_event(&app, 0, 0).is_empty());
+        assert!(!app.is_dirty(), "PLAY never mutates pattern data");
+    }
+
+    #[test]
+    fn play_and_rec_use_the_selected_scale() {
+        let mut app = app_with(4, 1);
+        app.handle_key(Key::ctrl(Code::Char('r')));
+        app.handle_key(Key::ch('s'));
+        assert_eq!(slot_event(&app, 0, 0), note(61, 100), "chromatic s = C#");
+
+        let mut app = app_with(4, 1);
+        app.project.composition.global_settings_mut().scale =
+            mtrak_core::settings::lookup_builtin("major").unwrap();
+        app.handle_key(Key::ctrl(Code::Char('r')));
+        app.handle_key(Key::ch('x'));
+        assert_eq!(slot_event(&app, 0, 0), note(62, 100), "major degree 1 = D");
+    }
+
+    #[test]
+    fn channel_and_velocity_inherit_independently_from_earlier_rows() {
+        let mut app = app_with(8, 1);
+        app.project
+            .composition
+            .pattern_mut(PatternId(0))
+            .unwrap()
+            .set_event(
+                0,
+                0,
+                Event::Channel(ChannelMessage {
+                    kind: ChannelKind::ControlChange,
+                    channel: Some(5),
+                    data1: Some(7),
+                    data2: Some(99),
+                }),
+            );
+        app.project
+            .composition
+            .pattern_mut(PatternId(0))
+            .unwrap()
+            .set_event(
+                1,
+                0,
+                Event::Channel(ChannelMessage {
+                    kind: ChannelKind::NoteOn,
+                    channel: None,
+                    data1: Some(60),
+                    data2: Some(42),
+                }),
+            );
+        app.handle_key(Key::ctrl(Code::Char('r')));
+        app.apply(Action::MoveDown);
+        app.apply(Action::MoveDown);
+        app.handle_key(Key::ch('z'));
+        let expected = Event::Channel(ChannelMessage::with_data(
+            ChannelKind::NoteOn,
+            5,
+            60,
+            Some(42),
+        ));
+        assert_eq!(slot_event(&app, 2, 0), expected);
+    }
+
+    #[test]
+    fn play_and_rec_navigate_cell_wide_and_keep_the_nibble() {
+        let mut app = app_with(8, 3);
+        app.apply(Action::MoveRight);
+        app.apply(Action::MoveRight);
+        assert_eq!(app.cursor(), (0, 0, 2));
+        app.handle_key(Key::ctrl(Code::Char('r')));
+        assert_eq!(app.mode(), Mode::Rec);
+        assert_eq!(app.cursor(), (0, 0, 2));
+
+        app.handle_key(Key::new(Code::Right));
+        assert_eq!(app.cursor(), (0, 1, 2), "Right selects the next track");
+        app.handle_key(Key::new(Code::Tab));
+        assert_eq!(app.cursor(), (0, 2, 2));
+        app.handle_key(Key::shift(Code::Tab));
+        assert_eq!(app.cursor(), (0, 1, 2));
+        app.handle_key(Key::new(Code::Left));
+        assert_eq!(app.cursor(), (0, 0, 2));
+
+        app.handle_key(Key::ctrl(Code::Char('e')));
+        assert_eq!(app.mode(), Mode::Edit);
+        assert_eq!(app.cursor(), (0, 0, 2), "the nibble was preserved");
+        app.handle_key(Key::new(Code::Right));
+        assert_eq!(app.cursor(), (0, 0, 3), "EDIT moves by one nibble");
+    }
+
+    #[test]
+    fn play_and_rec_disable_pattern_editing_except_undo_redo() {
+        let mut app = app_with(8, 2);
+        app.project
+            .composition
+            .pattern_mut(PatternId(0))
+            .unwrap()
+            .set_event(0, 0, note(60, 100));
+        app.handle_key(Key::ctrl(Code::Char('r')));
+        let before = app.pattern().clone();
+        let cursor = app.cursor();
+        let brush = (app.brush_width(), app.brush_height());
+        for action in [
+            Action::TrackInsert,
+            Action::TrackDelete,
+            Action::BrushWider,
+            Action::BrushTaller,
+            Action::SelectRight,
+            Action::SelectDown,
+            Action::InsertBlock,
+            Action::DeleteBlock,
+            Action::BackspaceBlock,
+            Action::ClearBlock,
+            Action::Cut,
+            Action::Copy,
+            Action::Paste,
+            Action::ToggleOffsets,
+            Action::OpenEventEditor,
+        ] {
+            app.apply(action);
+        }
+        app.handle_key(Key::ch('9'));
+        app.handle_key(Key::new(Code::Backspace));
+        assert_eq!(app.mode(), Mode::Rec);
+        assert_eq!(app.pattern(), &before, "no editing action may mutate");
+        assert_eq!(app.cursor(), cursor);
+        assert_eq!((app.brush_width(), app.brush_height()), brush);
+        assert!(app.selection().is_none());
+        assert!(!app.offsets_visible());
+    }
+
+    #[test]
+    fn undo_and_redo_work_in_play_and_rec() {
+        for mode in [Mode::Play, Mode::Rec] {
+            let mut app = app_with(4, 1);
+            type_hex(&mut app, "903C64");
+            assert_eq!(slot_event(&app, 0, 0), note(60, 100));
+            app.handle_key(Key::ctrl(Code::Char('r')));
+            app.set_mode(mode);
+            app.handle_key(Key::ctrl(Code::Char('z')));
+            assert_eq!(slot_event(&app, 0, 0), Event::Empty, "{mode:?}");
+            app.handle_key(Key::ctrl(Code::Char('y')));
+            assert_eq!(slot_event(&app, 0, 0), note(60, 100), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn mode_switches_finalize_one_partial_edit_and_preserve_coordinates() {
+        let mut app = app_with(8, 3);
+        app.apply(Action::MoveDown);
+        app.handle_key(Key::ch('9'));
+        assert_eq!(app.cursor(), (1, 0, 1));
+        app.handle_key(Key::ctrl(Code::Char('p')));
+        assert_eq!(app.mode(), Mode::Play);
+        assert_eq!(app.cursor(), (1, 0, 1));
+        assert_ne!(
+            slot_event(&app, 1, 0),
+            Event::Empty,
+            "the partial edit was finalized, not discarded"
+        );
+        app.handle_key(Key::ctrl(Code::Char('e')));
+        assert_eq!(app.cursor(), (1, 0, 1));
+
+        // Switching without a partial edit must not mutate anything.
+        let mut app = app_with(4, 1);
+        app.handle_key(Key::ctrl(Code::Char('r')));
+        app.handle_key(Key::ctrl(Code::Char('e')));
+        assert_eq!(slot_event(&app, 0, 0), Event::Empty);
+    }
+
+    #[test]
+    fn live_recording_writes_the_playhead_offset_and_rebuilds_the_stream() {
+        let mut app = app_with(8, 1);
+        // An old event still pending later in the playhead row.
+        {
+            let slot = app
+                .project
+                .composition
+                .pattern_mut(PatternId(0))
+                .unwrap()
+                .slot_mut(0, 0)
+                .unwrap();
+            slot.event = note(67, 100);
+            slot.offset = 3;
+        }
+        let backend = MockBackend::new(&["out"]);
+        let sent = backend.sent_handle();
+        let mut manager = OutputManager::new(Box::new(backend) as Box<dyn MidiBackend>);
+        manager.select(0).unwrap();
+        app.set_midi(manager);
+
+        app.start_playback();
+        app.tick_playback(25_000);
+        assert_eq!(app.play_tick, 1, "one tick into row 0");
+        app.handle_key(Key::ctrl(Code::Char('r')));
+        assert_eq!(app.mode(), Mode::Rec);
+        app.handle_key(Key::ch('z'));
+
+        assert_eq!(app.play_tick, 1, "live recording preserves the tick");
+        assert_eq!(
+            app.project
+                .composition
+                .pattern(PatternId(0))
+                .unwrap()
+                .slot(0, 0)
+                .unwrap()
+                .offset,
+            1,
+            "the intra-row offset is captured"
+        );
+        assert_eq!(slot_event(&app, 0, 0), note(60, 100));
+        assert_eq!(
+            sent.borrow().as_slice(),
+            &[vec![0x90, 60, 100]],
+            "the audition is sent exactly once"
+        );
+
+        // Play past the replaced event's old offset; it must not sound.
+        app.tick_playback(100_000);
+        assert_eq!(
+            sent.borrow().as_slice(),
+            &[vec![0x90, 60, 100]],
+            "the replaced pending event is gone"
+        );
+    }
+
+    #[test]
+    fn command_mode_pauses_and_resumes_playback() {
+        let mut app = app_with(8, 1);
+        app.start_playback();
+        app.tick_playback(25_000);
+        let tick = app.play_tick;
+        let micros = app.play_micros;
+
+        app.handle_key(Key::ch(':'));
+        assert!(!app.is_playing(), "command mode pauses the transport");
+        assert_eq!(app.mode(), Mode::Command);
+        assert_eq!(app.play_tick, tick);
+        assert_eq!(app.play_micros, micros);
+
+        type_hex(&mut app, "bpm 140");
+        app.handle_key(Key::new(Code::Enter));
+        assert!(app.is_playing(), "successful command resumes playback");
+        assert_eq!(app.mode(), Mode::Edit);
+        assert_eq!(app.play_tick, tick, "resume keeps the exact tick");
+        assert_eq!(app.project().composition.bpm(), Bpm::from_int(140).unwrap());
+    }
+
+    #[test]
+    fn command_resume_rebuilds_against_project_changes() {
+        let mut app = app_with(8, 1);
+        app.start_playback();
+        app.tick_playback(25_000);
+        let old_end = app.play_end_tick;
+        app.handle_key(Key::ch(':'));
+        assert!(!app.is_playing());
+        type_hex(&mut app, "rows 2");
+        app.handle_key(Key::new(Code::Enter));
+        assert!(app.is_playing());
+        let row_len = mtrak_core::timing::row_ticks(24, 4).unwrap() as u64;
+        assert_eq!(app.play_end_tick, 2 * row_len, "rows change is reflected");
+        assert_ne!(app.play_end_tick, old_end);
+        app.tick_playback(1_000_000);
+        assert!(!app.is_playing(), "the rebuilt end stops playback");
+    }
+
+    #[test]
+    fn command_cancellation_and_failure_preserve_the_pause() {
+        // Cancellation resumes from the paused tick.
+        let mut app = app_with(8, 1);
+        app.start_playback();
+        app.tick_playback(25_000);
+        let tick = app.play_tick;
+        app.handle_key(Key::ch(':'));
+        assert!(!app.is_playing());
+        app.handle_key(Key::new(Code::Esc));
+        assert!(app.is_playing());
+        assert_eq!(app.play_tick, tick);
+
+        // A failed command keeps command mode open and playback paused.
+        let mut app = app_with(8, 1);
+        app.start_playback();
+        app.handle_key(Key::ch(':'));
+        type_hex(&mut app, "not-a-command");
+        app.handle_key(Key::new(Code::Enter));
+        assert_eq!(app.mode(), Mode::Command);
+        assert!(app.command_failed());
+        assert!(!app.is_playing());
+        app.handle_key(Key::new(Code::Esc));
+        assert!(app.is_playing());
+
+        // Command mode entered while stopped never starts playback.
+        let mut app = app_with(8, 1);
+        app.handle_key(Key::ch(':'));
+        assert!(!app.is_playing());
+        app.handle_key(Key::new(Code::Esc));
+        assert!(!app.is_playing());
+    }
+
+    #[test]
+    fn esc_stops_playback_and_s_sets_the_start_row_in_every_mode() {
+        let mut app = app_with(8, 1);
+        app.start_playback();
+        assert!(app.is_playing());
+        app.handle_key(Key::new(Code::Esc));
+        assert!(!app.is_playing());
+
+        for mode in [Mode::Play, Mode::Rec, Mode::Edit] {
+            let mut app = app_with(8, 1);
+            app.set_mode(mode);
+            app.apply(Action::MoveDown);
+            app.apply(Action::MoveDown);
+            app.handle_key(Key::ch('S'));
+            assert_eq!(app.start_row(), 2, "{mode:?}");
+        }
+
+        // With playback stopped, Esc keeps its selection-cancel behavior.
+        let mut app = app_with(8, 1);
+        app.apply(Action::SelectRight);
+        assert!(app.selection().is_some());
+        app.handle_key(Key::new(Code::Esc));
+        assert!(app.selection().is_none());
+    }
+
+    #[test]
+    fn play_and_rec_lock_the_cursor_row_to_the_playhead_but_edit_does_not() {
+        let mut app = app_with(8, 1);
+        app.set_mode(Mode::Play);
+        app.start_playback();
+        assert_eq!(app.cursor().0, 0);
+        app.tick_playback(125_000);
+        assert_eq!(app.play_current_row, 1);
+        assert_eq!(app.cursor().0, 1, "PLAY follows the playhead");
+
+        app.handle_key(Key::ctrl(Code::Char('r')));
+        assert_eq!(app.cursor().0, 1);
+        app.tick_playback(125_000);
+        assert_eq!(app.play_current_row, 2);
+        assert_eq!(app.cursor().0, 2, "REC follows the playhead");
+
+        app.handle_key(Key::ctrl(Code::Char('e')));
+        app.tick_playback(125_000);
+        assert_eq!(app.play_current_row, 3);
+        assert_eq!(app.cursor().0, 2, "EDIT leaves the cursor alone");
+        app.handle_key(Key::new(Code::Esc));
+        assert!(!app.is_playing(), "Esc stops the transport");
+    }
+
+    #[test]
+    fn stopping_playback_leaves_the_cursor_at_the_stopping_row() {
+        let mut app = app_with(8, 1);
+        app.set_mode(Mode::Play);
+        app.start_playback();
+        app.tick_playback(2 * 125_000 + 1);
+        assert_eq!(app.play_current_row, 2);
+        app.handle_key(Key::new(Code::Esc));
+        assert!(!app.is_playing());
+        assert_eq!(app.cursor().0, 2);
+    }
+
+    #[test]
+    fn mode_switches_do_not_start_or_stop_playback_and_space_still_toggles() {
+        let mut app = app_with(8, 1);
+        app.set_mode(Mode::Play);
+        app.start_playback();
+        for mode in [Mode::Rec, Mode::Edit, Mode::Play] {
+            app.set_mode(mode);
+            assert!(app.is_playing(), "{mode:?} does not stop playback");
+        }
+
+        for mode in [Mode::Play, Mode::Rec, Mode::Edit] {
+            let mut app = app_with(8, 1);
+            app.set_mode(mode);
+            app.handle_key(Key::ch(' '));
+            assert!(app.is_playing(), "space starts in {mode:?}");
+            app.handle_key(Key::ch(' '));
+            assert!(!app.is_playing(), "space stops in {mode:?}");
+        }
+    }
+
+    #[test]
+    fn step_recording_always_writes_offset_zero() {
+        let mut app = app_with(4, 1);
+        {
+            let slot = app
+                .project
+                .composition
+                .pattern_mut(PatternId(0))
+                .unwrap()
+                .slot_mut(0, 0)
+                .unwrap();
+            slot.event = note(50, 10);
+            slot.offset = 5;
+        }
+        app.handle_key(Key::ctrl(Code::Char('r')));
+        app.handle_key(Key::ch('z'));
+        let slot = app
+            .project
+            .composition
+            .pattern(PatternId(0))
+            .unwrap()
+            .slot(0, 0)
+            .unwrap();
+        assert_eq!(slot.offset, 0);
+        assert_eq!(slot.event, note(60, 10));
+    }
+
+    #[test]
+    fn command_pause_sends_all_notes_off() {
+        let mut app = app_with(8, 1);
+        let backend = MockBackend::new(&["out"]);
+        let sent = backend.sent_handle();
+        let mut manager = OutputManager::new(Box::new(backend) as Box<dyn MidiBackend>);
+        manager.select(0).unwrap();
+        app.set_midi(manager);
+        app.start_playback();
+        app.handle_key(Key::ch(':'));
+        let messages = sent.borrow().clone();
+        assert_eq!(messages.len(), 16);
+        for (channel, message) in messages.iter().enumerate() {
+            assert_eq!(message, &[0xB0 | channel as u8, 123, 0]);
+        }
     }
 
     #[test]
@@ -4119,7 +4899,7 @@ mod tests {
                 .pattern_mut(PatternId(0))
                 .unwrap()
                 .set_event(0, 0, existing.clone());
-            app.apply(Action::ToggleNoteMode);
+            app.handle_key(Key::ctrl(Code::Char('r')));
             app.handle_key(Key::ch('z'));
             assert_eq!(
                 slot_event(&app, 0, 0),
@@ -4151,7 +4931,7 @@ mod tests {
                     Some(42),
                 )),
             );
-        app.apply(Action::ToggleNoteMode);
+        app.handle_key(Key::ctrl(Code::Char('r')));
         app.handle_key(Key::ch('z'));
         assert_eq!(sent.borrow().as_slice(), &[vec![0x95, 60, 42]]);
     }
@@ -4164,7 +4944,7 @@ mod tests {
         let mut manager = OutputManager::new(Box::new(backend) as Box<dyn MidiBackend>);
         manager.select(0).unwrap();
         app.set_midi(manager);
-        app.apply(Action::ToggleNoteMode);
+        app.handle_key(Key::ctrl(Code::Char('r')));
         app.handle_key(Key::ch('z'));
         assert_eq!(sent.borrow().as_slice(), &[vec![0x90, 60, 100]]);
     }
@@ -4319,7 +5099,7 @@ mod tests {
     fn enter_on_an_empty_cell_does_nothing() {
         let mut app = app_with(4, 2);
         app.handle_key(Key::new(Code::Enter));
-        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.mode(), Mode::Edit);
     }
 
     #[test]

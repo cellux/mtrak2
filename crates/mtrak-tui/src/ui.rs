@@ -166,24 +166,35 @@ fn draw(frame: &mut Frame, app: &App) {
 
 fn draw_header(frame: &mut Frame, app: &App, area: Area) {
     let composition = &app.project().composition;
-    let note_mode = match app.mode() {
-        Mode::Note | Mode::Normal if app.note_chromatic() => "chrom",
-        Mode::Note | Mode::Normal => "scal",
-        Mode::Command => "cmd",
-        Mode::Chooser => "choose",
+    let (mode_label, mode_style) = match app.mode() {
+        Mode::Play => (
+            "PLAY",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Mode::Rec => (
+            "REC",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Mode::Edit => (
+            "EDIT",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Mode::Command => ("CMD", Style::default().fg(Color::Yellow)),
+        Mode::Chooser => ("CHOOSE", Style::default().fg(Color::Yellow)),
     };
     let screen = match app.screen() {
         Screen::Help => "HELP".to_string(),
         Screen::Pattern => format!("PAT {:02X}", app.current_pattern().value()),
         Screen::Code => format!("MOD {:02X}", app.module_id()),
-    };
-    let note_style = if app.mode() == Mode::Note {
-        Style::default()
-            .fg(Color::White)
-            .bg(Color::Magenta)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
     };
     let line = Line::from(vec![
         Span::styled(" mtrak ", Style::default().add_modifier(Modifier::BOLD)),
@@ -194,8 +205,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Area) {
             screen,
             mtrak_core::settings::format_note(app.effective_settings().root),
         )),
-        Span::styled("NOTE", note_style),
-        Span::raw(format!(" {note_mode} ")),
+        Span::styled(format!("{mode_label:<6}"), mode_style),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -208,8 +218,10 @@ fn draw_help(frame: &mut Frame, area: Area) {
         Line::raw("F1 help   F2 pattern   F3 code"),
         Line::raw(""),
         Line::raw("Pattern: arrows move  hex types  enter edits  alt-enter choose"),
-        Line::raw("         o offsets  space play  : command  ctrl-n note  ctrl-s save"),
-        Line::raw("         ctrl-f follow the playhead  alt-. all notes off"),
+        Line::raw("         ctrl-p play  ctrl-r record  ctrl-e edit"),
+        Line::raw("         space play  S start row  o offsets  : command"),
+        Line::raw("         alt-0..9 record step  ctrl-y redo  ctrl-s save"),
+        Line::raw("         alt-. all notes off  esc stops playback"),
         Line::raw("Code:    alt-enter choose module  F5 reload  ctrl-z undo"),
         Line::raw("Command: tab completes :r and :w paths (type to filter)"),
         Line::raw("         arrows pick, tab/enter use, esc closes"),
@@ -241,7 +253,7 @@ fn draw_pattern(frame: &mut Frame, app: &App, area: Area) {
         .min(tracks);
     let visible_rows = (inner.height as usize).saturating_sub(1).max(1);
     let (cursor_row, cursor_track, cursor_nibble) = app.cursor();
-    let view_row = if app.is_playing() && app.follow_playhead() {
+    let view_row = if app.is_playing() && app.follows_playhead() {
         app.play_row()
     } else {
         cursor_row
@@ -250,7 +262,7 @@ fn draw_pattern(frame: &mut Frame, app: &App, area: Area) {
     let track_off = scroll_offset(cursor_track, tracks, visible_tracks);
     let selection = app.selection_bounds();
     let brush = app.brush_rect();
-    let note_mode = app.mode() == Mode::Note;
+    let note_mode = matches!(app.mode(), Mode::Play | Mode::Rec);
     let cursor_char = if cursor_nibble < 6 {
         cursor_nibble
     } else {
@@ -619,7 +631,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Area) {
             let hint = match app.screen() {
                 Screen::Help => "F2 pattern  F3 code  ctrl-q quit",
                 Screen::Pattern => {
-                    "space play  s start  : command  enter edit  alt-enter choose  ctrl-s save"
+                    "space play  S start  ctrl-p/r/e mode  : command  esc stop  ctrl-s save"
                 }
                 Screen::Code => "alt-enter choose module  F5 reload  ctrl-z undo  ctrl-s save",
             };
@@ -877,7 +889,7 @@ mod tests {
     }
 
     #[test]
-    fn follow_playhead_scrolls_the_view_to_the_playing_row() {
+    fn follow_playhead_is_derived_from_the_musical_mode() {
         use crate::key::Action;
 
         let mut app = app_with(64, 2);
@@ -887,9 +899,10 @@ mod tests {
         app.apply(Action::SetStartRow);
         app.apply(Action::Home);
         assert_eq!(app.cursor().0, 0);
-        app.handle_key(Key::ctrl(Code::Char('f')));
-        assert!(app.follow_playhead());
+        assert_eq!(app.mode(), Mode::Play);
+        assert!(app.follows_playhead());
         app.start_playback();
+        assert_eq!(app.cursor().0, 50, "PLAY snaps the cursor to the start row");
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let marker_visible = |terminal: &mut Terminal<TestBackend>, app: &App| {
@@ -901,11 +914,13 @@ mod tests {
         };
 
         assert!(marker_visible(&mut terminal, &app), "playhead is in view");
-        app.handle_key(Key::ctrl(Code::Char('f')));
-        assert!(!app.follow_playhead());
+        app.handle_key(Key::ctrl(Code::Char('e')));
+        assert_eq!(app.mode(), Mode::Edit);
+        assert!(!app.follows_playhead());
+        app.apply(Action::Home);
         assert!(
             !marker_visible(&mut terminal, &app),
-            "without follow the view stays at the cursor"
+            "EDIT does not scroll to the playhead"
         );
     }
 
@@ -948,29 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn note_mode_highlights_the_header_label() {
-        let mut app = app_with(4, 2);
-        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
-        let note_cell = |terminal: &mut Terminal<TestBackend>, app: &App| {
-            terminal.draw(|frame| draw(frame, app)).unwrap();
-            let buffer = terminal.backend().buffer();
-            let x = screen_rows(buffer)[0].find("NOTE").expect("header label") as u16;
-            (0..4).map(|i| buffer[(x + i, 0)].bg).collect::<Vec<_>>()
-        };
-
-        assert!(note_cell(&mut terminal, &app)
-            .iter()
-            .all(|bg| *bg != Color::Magenta));
-
-        app.handle_key(Key::ctrl(Code::Char('n')));
-        assert_eq!(app.mode(), Mode::Note);
-        assert!(note_cell(&mut terminal, &app)
-            .iter()
-            .all(|bg| *bg == Color::Magenta));
-    }
-
-    #[test]
-    fn header_shows_the_note_entry_mode_in_normal_and_note_modes() {
+    fn header_shows_the_active_musical_mode() {
         let mut app = app_with(4, 2);
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
         let header = |terminal: &mut Terminal<TestBackend>, app: &App| {
@@ -978,19 +971,18 @@ mod tests {
             screen_rows(terminal.backend().buffer())[0].clone()
         };
 
-        assert!(header(&mut terminal, &app).contains("NOTE scal"));
+        assert!(header(&mut terminal, &app).contains("PLAY"));
 
-        // Shift-N toggles chromatic entry even outside note mode; the header
-        // must not keep claiming scale entry.
-        app.handle_key(Key::ch('N'));
-        assert!(header(&mut terminal, &app).contains("NOTE chrom"));
+        app.handle_key(Key::ctrl(Code::Char('r')));
+        assert_eq!(app.mode(), Mode::Rec);
+        assert!(header(&mut terminal, &app).contains("REC"));
 
-        app.handle_key(Key::ctrl(Code::Char('n')));
-        assert_eq!(app.mode(), Mode::Note);
-        assert!(header(&mut terminal, &app).contains("NOTE chrom"));
+        app.handle_key(Key::ctrl(Code::Char('e')));
+        assert_eq!(app.mode(), Mode::Edit);
+        assert!(header(&mut terminal, &app).contains("EDIT"));
 
-        app.handle_key(Key::ch('N'));
-        assert!(header(&mut terminal, &app).contains("NOTE scal"));
+        app.handle_key(Key::ch(':'));
+        assert!(header(&mut terminal, &app).contains("CMD"));
     }
 
     fn cells_with_bg(buffer: &ratatui::buffer::Buffer, bg: Color) -> Vec<(u16, u16)> {

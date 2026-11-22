@@ -322,7 +322,6 @@ fn write_settings(w: &mut Writer, settings: &Settings) {
     w.u8(settings.root);
     w.u16(settings.scale.mask());
     w.u8(settings.modal_degree);
-    w.u8(u8::from(settings.scale_aware));
 }
 
 fn read_settings(r: &mut Reader<'_>) -> Result<Settings, MetadataError> {
@@ -330,7 +329,6 @@ fn read_settings(r: &mut Reader<'_>) -> Result<Settings, MetadataError> {
         root: r.u8()?,
         scale: Scale::from_mask(r.u16()?),
         modal_degree: r.u8()?,
-        scale_aware: r.u8()? != 0,
     })
 }
 

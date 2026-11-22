@@ -19,8 +19,6 @@ pub enum SettingChange {
     Scale(u16),
     /// Modal degree within the scale.
     ModalDegree(u8),
-    /// Whether note entry is scale-aware.
-    ScaleAware(bool),
 }
 
 /// An effect requested by a running macro.
