@@ -127,7 +127,7 @@ decision.
 
 ### PR-010 — PLAY and REC whitelist actions instead of duplicating dispatch
 
-- Status: Accepted
+- Status: Superseded by PR-011 (the `.` cell clear is now allowed in PLAY/REC).
 - Decision: `App::apply` receives every mapped action, but in PLAY and REC only
   navigation, playback controls, mode switching, command entry, and undo/redo
   are honored. Nibble typing, structural edits, selections, brush changes,
@@ -138,3 +138,17 @@ decision.
   the gate for every edit action. The nibble coordinate is retained even though
   horizontal movement is cell-wide.
 - Source: `PLAN.md` §3.2, §3.3, §3.4, §4.1.
+
+### PR-011 — `.` clears the cursor cell in PLAY and REC
+
+- Status: Accepted
+- Decision: the `.` clear action is available in PLAY, REC, and EDIT. In EDIT
+  it keeps the existing selection/brush byte-aligned semantics. In PLAY and REC
+  there is no editable brush or selection, so it clears the whole event cell at
+  the logical cursor regardless of the preserved nibble coordinate. The clear
+  records one undo step, preserves the cursor, and rebuilds the future playback
+  stream when playback is running so a cleared pending event cannot sound.
+- Consequence: PR-010's list of disabled PLAY/REC actions no longer includes
+  the `.` clear; every other gate remains in force. Clearing cannot accidentally
+  become a partial byte edit in PLAY/REC.
+- Source: follow-up request; supersedes the `.` portion of PR-010.

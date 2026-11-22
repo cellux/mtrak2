@@ -118,11 +118,27 @@ Verification: `cargo fmt --all -- --check` clean;
 `cargo clippy --workspace --all-targets -- -D warnings` clean;
 `cargo test --workspace` 287 tests.
 
+## 2026-11-22T20:15:20Z — `.` clear available in PLAY and REC
+
+Made the `.` clear action available in all three musical modes. In EDIT it
+keeps the existing byte-aligned selection/brush semantics. In PLAY and REC it
+clears the whole event cell at the logical cursor regardless of the preserved
+nibble coordinate, records one undo step, preserves the cursor, and rebuilds
+the future playback stream when playback is running so a cleared pending event
+cannot sound. Recorded the change as PR-011, superseding the `.` portion of
+PR-010, and added tests for the cell-wide clear, undo, and pending-event
+removal.
+
+Verification: `cargo fmt --all -- --check` clean;
+`cargo clippy --workspace --all-targets -- -D warnings` clean;
+`cargo test --workspace` 289 tests.
+
 ## HANDOFF
 
 **State:** The PLAY/REC/EDIT milestone is implemented and green, including a
 yellow start-row marker, a session keyboard transpose (`F7`/`F8`,
-`:transpose`), and the pattern LPB in the header. No pending work is known.
+`:transpose`), pattern LPB in the header, and the `.` cell clear in every
+musical mode. No pending work is known.
 
 **Durable decisions:** PR-001…PR-010 in `DECISIONS.md`.
 

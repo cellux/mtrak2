@@ -738,6 +738,20 @@ impl App {
         }
     }
 
+    /// The whole-cell rectangle containing the logical cursor.
+    fn cursor_cell_rect(&self) -> Rect {
+        let npc = self.nibbles_per_cell().max(1);
+        let (rows, _) = self.pattern_geometry();
+        let row = self.row.min(rows.saturating_sub(1));
+        let left = self.track * npc;
+        Rect {
+            top: row,
+            bottom: row,
+            left,
+            right: left + npc - 1,
+        }
+    }
+
     /// Whether any cell in `rect` holds a non-inline (opaque) event.
     fn rect_has_complex(&self, rect: Rect) -> bool {
         let npc = self.nibbles_per_cell().max(1);
@@ -987,11 +1001,7 @@ impl App {
                     self.backspace_block();
                 }
             }
-            Action::ClearBlock => {
-                if editing {
-                    self.clear_block();
-                }
-            }
+            Action::ClearBlock => self.clear_block(),
             Action::CancelSelection => self.cancel_selection(),
             Action::Cut => {
                 if editing {
@@ -1507,7 +1517,12 @@ impl App {
     }
 
     fn clear_block(&mut self) {
-        let rect = self.operation_rect();
+        // PLAY/REC have no brush or selection, so `.` means the cursor cell.
+        let rect = if self.mode.is_editing() {
+            self.operation_rect()
+        } else {
+            self.cursor_cell_rect()
+        };
         if self.rect_has_complex(rect) {
             self.set_message("cannot clear a non-inline event".to_string(), true);
             return;
@@ -1516,6 +1531,9 @@ impl App {
         self.record_pattern();
         self.clear_rect(rect);
         self.after_pattern_change();
+        if self.playing {
+            self.rebuild_future_stream();
+        }
     }
 
     fn copy(&mut self) {
@@ -3665,6 +3683,68 @@ mod tests {
     }
 
     #[test]
+    fn clear_block_clears_the_cursor_cell_in_play_and_rec() {
+        for mode in [Mode::Play, Mode::Rec] {
+            let mut app = app_with(4, 2);
+            app.project
+                .composition
+                .pattern_mut(PatternId(0))
+                .unwrap()
+                .set_event(0, 0, note(60, 100));
+            app.project
+                .composition
+                .pattern_mut(PatternId(0))
+                .unwrap()
+                .set_event(0, 1, note(62, 100));
+            // A non-zero nibble must not turn `.` into a partial byte clear.
+            app.apply(Action::MoveRight);
+            app.apply(Action::MoveRight);
+            app.set_mode(mode);
+            app.apply(Action::ClearBlock);
+            assert_eq!(slot_event(&app, 0, 0), Event::Empty, "{mode:?}");
+            assert_eq!(
+                slot_event(&app, 0, 1),
+                note(62, 100),
+                "only the cursor cell is cleared in {mode:?}"
+            );
+            assert_eq!(app.cursor(), (0, 0, 2), "the cursor is unchanged");
+            app.apply(Action::Undo);
+            assert_eq!(slot_event(&app, 0, 0), note(60, 100), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn clear_block_while_playing_drops_pending_events() {
+        let mut app = app_with(8, 1);
+        {
+            let slot = app
+                .project
+                .composition
+                .pattern_mut(PatternId(0))
+                .unwrap()
+                .slot_mut(0, 0)
+                .unwrap();
+            slot.event = note(67, 100);
+            slot.offset = 3;
+        }
+        app.start_playback();
+        app.tick_playback(25_000);
+        app.handle_key(Key::ctrl(Code::Char('r')));
+        app.apply(Action::ClearBlock);
+        assert_eq!(slot_event(&app, 0, 0), Event::Empty);
+        assert!(
+            !app.play_events.iter().any(|timed| {
+                matches!(
+                    &timed.event,
+                    Event::Channel(message)
+                        if message.kind == ChannelKind::NoteOn && message.data1 == Some(67)
+                )
+            }),
+            "the cleared cell's pending event is not in the rebuilt stream"
+        );
+    }
+
+    #[test]
     fn esc_cancels_a_selection_without_mutating() {
         let mut app = app_with(4, 2);
         app.apply(Action::SelectDown);
@@ -4619,7 +4699,6 @@ mod tests {
             Action::InsertBlock,
             Action::DeleteBlock,
             Action::BackspaceBlock,
-            Action::ClearBlock,
             Action::Cut,
             Action::Copy,
             Action::Paste,
