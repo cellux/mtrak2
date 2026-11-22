@@ -78,6 +78,8 @@ pub enum Command {
     Event(Vec<u8>),
     /// `:step N` — set the session-local recording step.
     Step(u32),
+    /// `:transpose [N]` — inspect or set the session keyboard transpose.
+    Transpose(Option<i32>),
     /// `:seed [VALUE|random]` — inspect or change the random seed.
     Seed(SeedArg),
     /// `:help`.
@@ -107,6 +109,19 @@ pub fn parse_u64(input: &str) -> Option<u64> {
         u64::from_str_radix(hex, 16).ok()
     } else {
         input.parse::<u64>().ok()
+    }
+}
+
+/// Parses a signed integer in decimal or `0x`/`0X` hexadecimal.
+pub fn parse_i32(input: &str) -> Option<i32> {
+    let input = input.trim();
+    if let Some(hex) = input
+        .strip_prefix("0x")
+        .or_else(|| input.strip_prefix("0X"))
+    {
+        i32::from_str_radix(hex, 16).ok()
+    } else {
+        input.parse::<i32>().ok()
     }
 }
 
@@ -147,6 +162,12 @@ pub fn parse(input: &str) -> Result<Command, String> {
         "port" | "midi" => parse_port(&rest)?,
         "event" | "ev" => Command::Event(parse_event_bytes(&rest)?),
         "step" => Command::Step(int_arg(&rest, "step")?),
+        "transpose" | "trans" | "tr" => match rest.first() {
+            None => Command::Transpose(None),
+            Some(value) => Command::Transpose(Some(
+                parse_i32(value).ok_or_else(|| format!("invalid value for transpose: {value}"))?,
+            )),
+        },
         "seed" => {
             let raw = rest.first().map(|value| value.to_ascii_lowercase());
             match raw.as_deref() {
@@ -341,6 +362,10 @@ mod tests {
         assert_eq!(parse(":step 0"), Ok(Command::Step(0)));
         assert_eq!(parse(":step 17"), Ok(Command::Step(17)));
         assert!(parse(":step").is_err());
+        assert_eq!(parse(":transpose"), Ok(Command::Transpose(None)));
+        assert_eq!(parse(":transpose -12"), Ok(Command::Transpose(Some(-12))));
+        assert_eq!(parse(":tr +12"), Ok(Command::Transpose(Some(12))));
+        assert!(parse(":transpose nope").is_err());
         assert!(parse(":follow").is_err(), "follow was removed");
         assert!(parse(":fol").is_err(), "follow was removed");
         assert_eq!(parse(":seed"), Ok(Command::Seed(SeedArg::Show)));

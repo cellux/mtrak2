@@ -200,6 +200,10 @@ pub enum Action {
     EditMode,
     /// Set the recording step (`Alt+0`..`Alt+9`).
     SetRecordStep(u8),
+    /// Decrease the keyboard transpose by an octave.
+    TransposeDown,
+    /// Increase the keyboard transpose by an octave.
+    TransposeUp,
     /// Enter command mode.
     CommandMode,
     /// Silence every channel.
@@ -279,6 +283,8 @@ pub fn lookup(key: Key) -> Option<Action> {
         (Function(2), false, _) => A::PatternScreen,
         (Function(3), false, _) => A::CodeScreen,
         (Function(5), false, _) => A::ReloadLua,
+        (Function(7), false, _) => A::TransposeDown,
+        (Function(8), false, _) => A::TransposeUp,
         _ => return None,
     };
     Some(action)
@@ -317,6 +323,14 @@ mod tests {
         assert_eq!(lookup(Key::ch('.')), Some(Action::ClearBlock));
         assert_eq!(lookup(Key::ctrl(Code::Char('x'))), Some(Action::Cut));
         assert_eq!(lookup(Key::ch(' ')), Some(Action::TogglePlay));
+        assert_eq!(
+            lookup(Key::new(Code::Function(7))),
+            Some(Action::TransposeDown)
+        );
+        assert_eq!(
+            lookup(Key::new(Code::Function(8))),
+            Some(Action::TransposeUp)
+        );
         assert_eq!(lookup(Key::ch('S')), Some(Action::SetStartRow));
         assert_eq!(lookup(Key::ch('s')), None, "lowercase s is a piano key");
         assert_eq!(lookup(Key::ch(':')), Some(Action::CommandMode));

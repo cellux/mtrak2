@@ -198,7 +198,11 @@ fn draw_header(frame: &mut Frame, app: &App, area: Area) {
     };
     let screen = match app.screen() {
         Screen::Help => "HELP".to_string(),
-        Screen::Pattern => format!("PAT {:02X}", app.current_pattern().value()),
+        Screen::Pattern => format!(
+            "PAT {:02X}  LPB {}",
+            app.current_pattern().value(),
+            app.pattern().lpb()
+        ),
         Screen::Code => format!("MOD {:02X}", app.module_id()),
     };
     let line = Line::from(vec![
@@ -210,7 +214,12 @@ fn draw_header(frame: &mut Frame, app: &App, area: Area) {
             screen,
             mtrak_core::settings::format_note(app.effective_settings().root),
         )),
-        Span::styled(format!("{mode_label:<6}"), mode_style),
+        Span::raw(if app.transpose() == 0 {
+            String::new()
+        } else {
+            format!("TRANS {:+}  ", app.transpose())
+        }),
+        Span::styled(format!("{mode_label:<4}"), mode_style),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -226,6 +235,7 @@ fn draw_help(frame: &mut Frame, area: Area) {
         Line::raw("         ctrl-p play  ctrl-r record  ctrl-e edit"),
         Line::raw("         space play  S start row  o offsets  : command"),
         Line::raw("         alt-0..9 record step  ctrl-y redo  ctrl-s save"),
+        Line::raw("         F7/F8 transpose -/+ octave  :transpose N"),
         Line::raw("         alt-. all notes off  esc stops playback"),
         Line::raw("Code:    alt-enter choose module  F5 reload  ctrl-z undo"),
         Line::raw("Command: tab completes :r and :w paths (type to filter)"),
@@ -640,7 +650,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Area) {
             let hint = match app.screen() {
                 Screen::Help => "F2 pattern  F3 code  ctrl-q quit",
                 Screen::Pattern => {
-                    "space play  S start  ctrl-p/r/e mode  : command  esc stop  ctrl-s save"
+                    "space play  S start  F7/F8 trsp  ctrl-p/r/e  : command  esc stop"
                 }
                 Screen::Code => "alt-enter choose module  F5 reload  ctrl-z undo  ctrl-s save",
             };
@@ -1022,6 +1032,10 @@ mod tests {
         };
 
         assert!(header(&mut terminal, &app).contains("PLAY"));
+        assert!(
+            header(&mut terminal, &app).contains("PAT 00  LPB 4"),
+            "the pattern's LPB is shown after its ID"
+        );
 
         app.handle_key(Key::ctrl(Code::Char('r')));
         assert_eq!(app.mode(), Mode::Rec);
@@ -1033,6 +1047,9 @@ mod tests {
 
         app.handle_key(Key::ch(':'));
         assert!(header(&mut terminal, &app).contains("CMD"));
+
+        app.set_transpose(12);
+        assert!(header(&mut terminal, &app).contains("TRANS +12"));
     }
 
     fn cells_with_bg(buffer: &ratatui::buffer::Buffer, bg: Color) -> Vec<(u16, u16)> {

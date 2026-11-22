@@ -84,11 +84,45 @@ Verification: `cargo fmt --all -- --check` clean;
 `cargo clippy --workspace --all-targets -- -D warnings` clean;
 `cargo test --workspace` 285 tests.
 
+## 2026-11-22T19:55:06Z — Header mode badge is four characters wide
+
+Reduced the header mode field from a fixed six-character pad to four, so the
+stylized `PLAY`, `REC`, and `EDIT` badges no longer carry unnecessary trailing
+highlight width. `CHOOSE` naturally exceeds the field; `CMD` pads to four.
+
+Verification: `cargo fmt --all -- --check` clean;
+`cargo clippy --workspace --all-targets -- -D warnings` clean; the affected UI
+test passes.
+
+## 2026-11-22T20:01:13Z — Session keyboard transpose (`F7`/`F8`, `:transpose`)
+
+Added a session-local keyboard transposition offset in semitones (default `0`,
+range `-127..=127`) used by PLAY audition and REC recording. `F7` and `F8`
+decrease/increase it by one octave and saturate at the range limits;
+`:transpose N` sets an absolute value and `:transpose` reports the current one.
+The offset is applied after scale-degree resolution, so recorded notes store
+the transposed pitch, and resulting notes clamp to `0..=127`. It is not
+serialized and does not mark the project dirty. The header shows `TRANS +N`
+when non-zero, and help/status text mentions the keys and command.
+
+Verification: `cargo fmt --all -- --check` clean;
+`cargo clippy --workspace --all-targets -- -D warnings` clean;
+`cargo test --workspace` 287 tests.
+
+## 2026-11-22T20:02:16Z — Pattern LPB in the header
+
+Added the current pattern's lines-per-beat after its ID in the header, e.g.
+`PAT 00  LPB 4`. Updated the header UI test to assert the field.
+
+Verification: `cargo fmt --all -- --check` clean;
+`cargo clippy --workspace --all-targets -- -D warnings` clean;
+`cargo test --workspace` 287 tests.
+
 ## HANDOFF
 
 **State:** The PLAY/REC/EDIT milestone is implemented and green, including a
-yellow start-row marker in the playhead gutter column. No pending work is
-known.
+yellow start-row marker, a session keyboard transpose (`F7`/`F8`,
+`:transpose`), and the pattern LPB in the header. No pending work is known.
 
 **Durable decisions:** PR-001…PR-010 in `DECISIONS.md`.
 

@@ -87,6 +87,12 @@ pub struct Message {
 
 /// How many candidates PgUp/PgDn move the completion highlight.
 const COMPLETION_PAGE: isize = 10;
+/// Range of the session-local keyboard transpose in semitones.
+pub const MIN_TRANSPOSE: i32 = -127;
+/// Range of the session-local keyboard transpose in semitones.
+pub const MAX_TRANSPOSE: i32 = 127;
+/// Octave step used by the transpose keys.
+const TRANSPOSE_OCTAVE: i32 = 12;
 
 /// The open Tab-completion list of a path argument on the command line.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -332,6 +338,8 @@ pub struct App {
     clipboard: NibbleClipboard,
     offsets_visible: bool,
     record_step: u8,
+    /// Session-local keyboard/input transpose in semitones.
+    transpose: i32,
     pattern_undo: HashMap<PatternId, UndoStack<Pattern>>,
     pattern_struct_undo: UndoStack<Composition>,
 
@@ -400,6 +408,7 @@ impl App {
             clipboard: NibbleClipboard::default(),
             offsets_visible: false,
             record_step: 1,
+            transpose: 0,
             pattern_undo: HashMap::new(),
             pattern_struct_undo: UndoStack::new(64),
             module_id,
@@ -584,6 +593,25 @@ impl App {
     /// Sets the session-local recording step.
     pub fn set_record_step(&mut self, step: u8) {
         self.record_step = step;
+    }
+
+    /// The session-local keyboard/input transpose in semitones.
+    pub fn transpose(&self) -> i32 {
+        self.transpose
+    }
+
+    /// Sets the keyboard transpose, clamped to the supported range.
+    pub fn set_transpose(&mut self, semitones: i32) {
+        self.transpose = semitones.clamp(MIN_TRANSPOSE, MAX_TRANSPOSE);
+    }
+
+    /// Changes the keyboard transpose by one octave.
+    pub fn transpose_octave(&mut self, direction: i32) {
+        let value = self
+            .transpose
+            .saturating_add(direction.signum() * TRANSPOSE_OCTAVE);
+        self.set_transpose(value);
+        self.set_message(format!("transpose {:+}", self.transpose), false);
     }
 
     /// The grid cursor as `(row, track, nibble)`.
@@ -988,6 +1016,8 @@ impl App {
             Action::TogglePlay => self.toggle_playback(),
             Action::SetStartRow => self.play_start_row = self.row,
             Action::SetRecordStep(step) => self.record_step = step,
+            Action::TransposeDown => self.transpose_octave(-1),
+            Action::TransposeUp => self.transpose_octave(1),
             Action::CommandMode => self.enter_command_mode(),
             Action::PlayMode => self.set_mode(Mode::Play),
             Action::RecMode => self.set_mode(Mode::Rec),
@@ -1704,6 +1734,7 @@ impl App {
             .iter()
             .find(|(key, _)| *key == c)
             .map(|(_, degree)| settings.degree_to_note(*degree))
+            .map(|note| (i32::from(note) + self.transpose).clamp(0, 127) as u8)
     }
 
     /// Writes one stopped-REC note and advances by the recording step.
@@ -2075,6 +2106,21 @@ impl App {
                     .map_err(|_| format!("recording step is too large: {value}"))?;
                 return Ok(());
             }
+            Command::Transpose(value) => {
+                match value {
+                    Some(value) => {
+                        if !(MIN_TRANSPOSE..=MAX_TRANSPOSE).contains(&value) {
+                            return Err(format!(
+                                "transpose out of range [{MIN_TRANSPOSE}, {MAX_TRANSPOSE}]: {value}"
+                            ));
+                        }
+                        self.set_transpose(value);
+                        self.set_message(format!("transpose {:+}", self.transpose), false);
+                    }
+                    None => self.set_message(format!("transpose {:+}", self.transpose), false),
+                }
+                return Ok(());
+            }
             Command::Bpm(value) => {
                 let bpm = Bpm::from_int(value).ok_or_else(|| format!("invalid bpm: {value}"))?;
                 self.project.composition.set_bpm(bpm);
@@ -2197,7 +2243,7 @@ impl App {
             },
             Command::Help => {
                 self.set_message(
-                    "read write export bpm tpb lpb root scale mode rows tracks pattern port event step seed"
+                    "read write export bpm tpb lpb root scale mode rows tracks pattern port event step transpose seed"
                         .to_string(),
                     false,
                 );
@@ -4004,6 +4050,78 @@ mod tests {
         app.handle_key(Key::new(Code::Enter));
         assert_eq!(app.recording_step(), 17);
         assert_eq!(app.mode(), Mode::Edit);
+    }
+
+    #[test]
+    fn transpose_shifts_keyboard_input_and_is_session_local() {
+        let mut app = app_with(4, 1);
+        assert_eq!(app.transpose(), 0);
+        assert!(!app.is_dirty());
+
+        app.handle_key(Key::new(Code::Function(8)));
+        assert_eq!(app.transpose(), 12);
+        assert!(!app.is_dirty(), "transpose is a session setting");
+        app.handle_key(Key::ctrl(Code::Char('r')));
+        app.handle_key(Key::ch('z'));
+        assert_eq!(slot_event(&app, 0, 0), note(72, 100));
+
+        let mut app = app_with(4, 1);
+        app.handle_key(Key::new(Code::Function(7)));
+        app.handle_key(Key::new(Code::Function(7)));
+        assert_eq!(app.transpose(), -24);
+        app.handle_key(Key::ctrl(Code::Char('r')));
+        app.handle_key(Key::ch('z'));
+        assert_eq!(slot_event(&app, 0, 0), note(36, 100));
+    }
+
+    #[test]
+    fn transpose_command_sets_reports_and_clamps() {
+        let mut app = app_with(4, 1);
+        app.handle_key(Key::ch(':'));
+        type_hex(&mut app, "transpose -12");
+        app.handle_key(Key::new(Code::Enter));
+        assert_eq!(app.transpose(), -12);
+        assert!(!app.is_dirty());
+        app.handle_key(Key::ctrl(Code::Char('r')));
+        app.handle_key(Key::ch('z'));
+        assert_eq!(slot_event(&app, 0, 0), note(48, 100));
+
+        // No argument reports the current value.
+        let mut app = app_with(4, 1);
+        app.set_transpose(5);
+        app.handle_key(Key::ch(':'));
+        type_hex(&mut app, "transpose");
+        app.handle_key(Key::new(Code::Enter));
+        assert_eq!(app.message().map(|m| m.text.as_str()), Some("transpose +5"));
+
+        // Out-of-range values are rejected and leave the setting unchanged.
+        app.handle_key(Key::ch(':'));
+        type_hex(&mut app, "transpose 999");
+        app.handle_key(Key::new(Code::Enter));
+        assert!(app.command_failed());
+        assert_eq!(app.transpose(), 5);
+        app.handle_key(Key::new(Code::Esc));
+
+        // F7/F8 saturate instead of overflowing.
+        app.set_transpose(MAX_TRANSPOSE);
+        app.handle_key(Key::new(Code::Function(8)));
+        assert_eq!(app.transpose(), MAX_TRANSPOSE);
+        app.set_transpose(MIN_TRANSPOSE);
+        app.handle_key(Key::new(Code::Function(7)));
+        assert_eq!(app.transpose(), MIN_TRANSPOSE);
+
+        // Notes clamp to the MIDI range.
+        let mut app = app_with(4, 1);
+        app.set_transpose(MAX_TRANSPOSE);
+        app.handle_key(Key::ctrl(Code::Char('r')));
+        app.handle_key(Key::ch('z'));
+        assert_eq!(slot_event(&app, 0, 0), note(127, 100));
+
+        let mut app = app_with(4, 1);
+        app.set_transpose(MIN_TRANSPOSE);
+        app.handle_key(Key::ctrl(Code::Char('r')));
+        app.handle_key(Key::ch('z'));
+        assert_eq!(slot_event(&app, 0, 0), note(0, 100));
     }
 
     #[test]
