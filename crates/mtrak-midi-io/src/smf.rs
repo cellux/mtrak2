@@ -272,10 +272,21 @@ pub fn import_standard(smf: &Smf<'_>) -> Result<TrackerProject, SmfError> {
     // Stable sort puts events in tick order while preserving source order.
     events.sort_by_key(|(tick, _)| *tick);
 
-    let max_tick = events.last().map(|(tick, _)| *tick).unwrap_or(0);
+    // A MIDI file's PPQ is an export resolution, not a musical quantity, so a
+    // file that used TPB=480 or 960 would otherwise drive the engine's clock
+    // 20-40x faster than a TPB=24 project for no gain. Reduce it when the
+    // reduction is exact (see `normalise_tpb`).
+    let (tpb, scale) = normalise_tpb(tpb, events.iter().map(|(tick, _)| *tick));
+    if scale > 1 {
+        for (tick, _) in &mut events {
+            *tick /= scale;
+        }
+    }
+    let ticks: Vec<Ticks> = events.iter().map(|(tick, _)| *tick).collect();
+    let max_tick = ticks.last().copied().unwrap_or(0);
     // Lossless import: one tick per row when it fits, so only truly
     // simultaneous events ever collide with each other.
-    let tick_len = choose_tick_len(tpb, max_tick);
+    let tick_len = choose_tick_len(tpb, &ticks);
     let lpb = tpb / tick_len;
     let rows = ((max_tick / u64::from(tick_len)) as usize + 1).clamp(1, MAX_ROWS);
 
@@ -327,16 +338,107 @@ pub fn import_standard(smf: &Smf<'_>) -> Result<TrackerProject, SmfError> {
     Ok(TrackerProject::new(composition))
 }
 
-fn choose_tick_len(tpb: u32, max_tick: Ticks) -> u32 {
+/// Import policy: the TPB we aim for, and the TPB we will not go below.
+///
+/// 96 is a conventional MIDI resolution and keeps the engine clock at 192 ticks
+/// per second at 120 BPM, which is dense enough for sub-row offsets and cheap
+/// enough for tick-granular macros. 24 is the default project resolution.
+const TARGET_TPB: u32 = 96;
+const MIN_TPB: u32 = 24;
+
+fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    a
+}
+
+/// Yields the divisors of `n` in ascending order.
+fn divisors_ascending(n: u64) -> impl Iterator<Item = u64> {
+    let mut small = Vec::new();
+    let mut large = Vec::new();
+    let mut d = 1u64;
+    while d * d <= n {
+        if n % d == 0 {
+            small.push(d);
+            if d != n / d {
+                large.push(n / d);
+            }
+        }
+        d += 1;
+    }
+    small.into_iter().chain(large.into_iter().rev())
+}
+
+/// Reduces a source TPB to a sane engine clock without disturbing the import.
+///
+/// The reduction is only taken when it is exact. Dividing the TPB by `k` is
+/// lossless when `k` divides every event tick: an event's row is
+/// `tick / row_ticks` and its offset is `tick % row_ticks`, and both scale by
+/// `1/k`, so every event stays on the row it started on. That is the limit the
+/// row grid imposes: normalisation never pushes an event off a row boundary.
+/// When no such `k` reaches the target the TPB is reduced as far as the
+/// constraint allows, and when nothing is reachable it is left untouched.
+///
+/// Returns the TPB to use and the factor by which every tick must be scaled.
+fn normalise_tpb(source_tpb: u32, ticks: impl Iterator<Item = Ticks>) -> (u32, u64) {
+    let mut g = u64::from(source_tpb);
+    for tick in ticks {
+        g = gcd_u64(g, tick);
+        if g == 1 {
+            return (source_tpb, 1);
+        }
+    }
+    // `k` ranges over the divisors of the gcd, so `source_tpb / k` is always an
+    // integer and the reduction is always exact.
+    let mut within_target: Option<(u32, u64)> = None;
+    let mut smallest: Option<(u32, u64)> = None;
+    let mut k = 1u64;
+    while k <= g {
+        if g % k == 0 {
+            let tpb = source_tpb / (k as u32);
+            if tpb < MIN_TPB {
+                break;
+            }
+            smallest = Some((tpb, k));
+            if within_target.is_none() && tpb <= TARGET_TPB {
+                within_target = Some((tpb, k));
+            }
+        }
+        k += 1;
+    }
+    within_target.or(smallest).unwrap_or((source_tpb, 1))
+}
+
+/// Picks the ticks-per-row for an imported pattern.
+///
+/// Preference order:
+/// 1. One tick per row when the whole file fits the row budget — lossless, and
+///    every event lands on a row boundary.
+/// 2. The finest divisor of `tpb` that both divides every event tick and fits
+///    the budget, so events stay on row boundaries (`offset == 0`).
+/// 3. The finest divisor of `tpb` that fits the budget, accepting sub-row
+///    offsets rather than dropping events.
+fn choose_tick_len(tpb: u32, ticks: &[Ticks]) -> u32 {
+    let max_tick = ticks.iter().copied().max().unwrap_or(0);
     if (max_tick as usize + 1) <= MAX_ROWS {
         return 1;
     }
-    let mut divisors: Vec<u32> = (1..=tpb).filter(|d| tpb % d == 0).collect();
-    divisors.sort_unstable();
-    for d in divisors {
-        let rows = (max_tick / u64::from(d)) as usize + 1;
-        if rows <= MAX_ROWS {
-            return d;
+    let fits = |len: u64| ((max_tick / len) as usize) < MAX_ROWS;
+    let mut g = u64::from(tpb);
+    for tick in ticks {
+        g = gcd_u64(g, *tick);
+    }
+    for len in divisors_ascending(g) {
+        if fits(len) {
+            return len as u32;
+        }
+    }
+    for len in divisors_ascending(u64::from(tpb)) {
+        if fits(len) {
+            return len as u32;
         }
     }
     tpb.max(1)
@@ -624,6 +726,61 @@ mod tests {
         assert_eq!(ticks, expected);
         assert_eq!(composition.pattern(PatternId(0)).unwrap().lpb(), 24);
         assert_eq!(composition.pattern(PatternId(0)).unwrap().track_count(), 2);
+    }
+
+    #[test]
+    fn normalise_tpb_prefers_the_target_resolution() {
+        // 480 -> 96 by dividing by 5: five ticks in, one tick out.
+        assert_eq!(normalise_tpb(480, [0, 120, 480].into_iter()), (96, 5));
+        assert_eq!(normalise_tpb(960, [0, 960].into_iter()), (96, 10));
+        // Tick 7 shares no factor with 480, so nothing is reachable.
+        assert_eq!(normalise_tpb(480, [0, 7].into_iter()), (480, 1));
+        // Already at or below the target: leave it alone.
+        assert_eq!(normalise_tpb(24, [0, 6].into_iter()), (24, 1));
+    }
+
+    #[test]
+    fn high_tpb_is_reduced_without_moving_events() {
+        // A 480 PPQ file whose events sit on 16th-note and beat boundaries.
+        let audio: Vec<(Ticks, Event)> =
+            vec![(0, note(60, 0)), (120, note(62, 0)), (480, note(64, 0))];
+        let bytes = write_smf(480, &[audio]).unwrap();
+        let loaded = load(&bytes).unwrap();
+        let composition = &loaded.project.composition;
+        assert_eq!(composition.tpb(), 96, "480 divides down to 96");
+        // Every event must still land on a row boundary.
+        let pattern = composition.pattern(PatternId(0)).unwrap();
+        assert!(
+            pattern.iter_slots().all(|(_, _, slot)| slot.offset == 0),
+            "the row grid must capture every event without offsets"
+        );
+        // Musical positions are unchanged: 0, a quarter beat and one beat.
+        let positions: Vec<f64> = render_events(composition, None)
+            .iter()
+            .filter(|timed| matches!(timed.event, Event::Channel(_)))
+            .map(|timed| timed.tick as f64 / f64::from(composition.tpb()))
+            .collect();
+        assert_eq!(positions, vec![0.0, 0.25, 1.0]);
+    }
+
+    #[test]
+    fn tpb_is_left_alone_when_reduction_would_move_events() {
+        // Tick 7 shares no factor with 480, so any reduction would move the
+        // event off its row. The import must keep the file's resolution.
+        let audio: Vec<(Ticks, Event)> = vec![(0, note(60, 0)), (7, note(62, 0))];
+        let bytes = write_smf(480, &[audio]).unwrap();
+        let loaded = load(&bytes).unwrap();
+        assert_eq!(loaded.project.composition.tpb(), 480);
+    }
+
+    #[test]
+    fn tpb_reduces_as_far_as_the_row_grid_allows() {
+        // gcd(480, 2) is 2, so only 480 and 240 are reachable resolutions.
+        // Neither meets the 96 target, so the import takes the smaller one.
+        let audio: Vec<(Ticks, Event)> = vec![(0, note(60, 0)), (2, note(62, 0))];
+        let bytes = write_smf(480, &[audio]).unwrap();
+        let loaded = load(&bytes).unwrap();
+        assert_eq!(loaded.project.composition.tpb(), 240);
     }
 
     #[test]

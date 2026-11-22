@@ -33,7 +33,7 @@ Feature parity with the Go version is not required. The Go source is a feature r
 - A pattern has its own LPB (lines per beat).
 - BPM and TPB (ticks per beat) are composition-wide.
 - TPB is the global scheduler/MIDI resolution. Each pattern's LPB must divide TPB exactly, and a pattern row lasts `TPB / LPB` global ticks.
-- Lua coroutines and all concurrent patterns share the same global TPB tick timeline; `wait(n)` counts global ticks.
+- Lua coroutines and all concurrent patterns share the same global TPB tick timeline; `wait(n)` counts beats.
 - A pattern stops when it reaches its final row in v1; it does not loop automatically.
 - A pattern-triggered child runs concurrently with its parent and has its own LPB.
 
@@ -124,7 +124,7 @@ Each macro-ID module defines one or more Lua functions and must expose a fixed e
 Macros run as coroutines. The scheduler resumes each active coroutine once per engine tick. A macro may emit zero or more MIDI/custom events before yielding and may use explicit APIs such as:
 
 - emit MIDI/custom events;
-- wait for a number of ticks;
+- wait for a number of beats;
 - trigger child patterns;
 - stop track coroutines with a boolean controlling whether the caller is included;
 - read or change permitted global/pattern settings;

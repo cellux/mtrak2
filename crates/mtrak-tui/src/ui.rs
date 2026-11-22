@@ -25,6 +25,10 @@ use crate::chooser::ChooserKind;
 use crate::code::{highlight, TokenKind};
 use crate::key::{Code, Key};
 
+/// Longest the loop sleeps before polling input again. This caps how long a
+/// key press can wait while playback is idle, and bounds redraw latency.
+const FRAME: Duration = Duration::from_millis(16);
+
 /// Background used to band the row the engine is currently playing.
 const PLAY_ROW_BG: Color = Color::Rgb(0, 64, 40);
 /// Foreground for text on the currently playing row.
@@ -61,10 +65,22 @@ fn event_loop<B: Backend>(
     on_tick: &mut impl FnMut(&mut App),
 ) -> io::Result<()> {
     let mut last = Instant::now();
+    let mut playing_row = app.play_row();
+    let mut dirty = true;
     while !app.should_quit() {
         on_tick(app);
-        terminal.draw(|frame| draw(frame, app))?;
-        if event::poll(Duration::from_millis(16))? {
+        // Redrawing is what costs time, and it happens *before* the poll, so a
+        // slow frame would delay the next event. Only repaint when something
+        // visible changed: a key, a resize, or the playing row moving.
+        if dirty {
+            terminal.draw(|frame| draw(frame, app))?;
+            dirty = false;
+        }
+        // Sleep only as long as the next event allows, so events leave when
+        // they are due instead of at the end of the next frame. `FRAME` caps
+        // the wait so input stays responsive when nothing is scheduled.
+        let timeout = app.next_event_in().map_or(FRAME, |next| next.min(FRAME));
+        if event::poll(timeout)? {
             match event::read()? {
                 CtEvent::Key(key) if key.kind == KeyEventKind::Press => {
                     if let Some(converted) = convert_key(key) {
@@ -74,12 +90,21 @@ fn event_loop<B: Backend>(
                 CtEvent::Resize(..) => {}
                 _ => {}
             }
+            dirty = true;
         }
         let now = Instant::now();
         let delta = now.duration_since(last);
         last = now;
         if app.is_playing() {
             app.tick_playback(delta.as_micros() as u64);
+            if app.play_row() != playing_row {
+                playing_row = app.play_row();
+                dirty = true;
+            }
+            if !app.is_playing() {
+                // The pattern ended: repaint once to clear the playhead.
+                dirty = true;
+            }
         }
     }
     Ok(())

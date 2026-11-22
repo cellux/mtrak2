@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use mtrak_core::composition::{Composition, Pattern, PatternId, Slot};
 use mtrak_core::event::{ChannelKind, ChannelMessage, Event};
@@ -763,6 +764,9 @@ impl App {
             Action::OpenChooser => return self.open_chooser(),
             Action::ReloadLua => return self.reload_lua(),
             Action::Quit => {
+                // Quitting is a user-initiated stop: do not leave notes
+                // ringing behind us.
+                self.stop_playback_and_release();
                 self.quit = true;
                 return;
             }
@@ -2498,7 +2502,7 @@ impl App {
     /// Starts or stops playback.
     pub fn toggle_playback(&mut self) {
         if self.playing {
-            self.stop_playback();
+            self.stop_playback_and_release();
         } else {
             self.start_playback();
         }
@@ -2525,12 +2529,81 @@ impl App {
         self.playing = true;
     }
 
-    /// Stops playback.
+    /// Clears playback state without touching the synth.
+    ///
+    /// A stop that only ends a pattern does not panic: a macro can start a
+    /// child pattern that keeps sounding. Reaching the end of *everything*
+    /// releases notes — see [`Self::tick_playback`] and
+    /// [`Self::stop_playback_and_release`].
     pub fn stop_playback(&mut self) {
         self.playing = false;
         self.play_events.clear();
         self.play_next = 0;
         self.play_end_tick = 0;
+    }
+
+    /// Whether another pattern is still sounding when this one ends.
+    ///
+    /// A trigger starts a child owned by the triggering track, and the engine
+    /// removes a child together with its parent (D-008), so a child cannot
+    /// outlive its parent: the timeline never holds events past the pattern's
+    /// last row. This is therefore always false today. It is kept as a guard so
+    /// that a longer child would not be silenced mid-note if the engine ever
+    /// allows one to outlive its parent.
+    pub fn other_patterns_playing(&self) -> bool {
+        self.playing
+            && self
+                .play_events
+                .get(self.play_next)
+                .is_some_and(|event| event.tick >= self.play_end_tick)
+    }
+
+    /// The tick playback must reach: the end of the pattern's rows, or the
+    /// last event when a child pattern runs past it.
+    fn playback_horizon(&self) -> u64 {
+        self.play_events.last().map_or(self.play_end_tick, |event| {
+            event.tick.max(self.play_end_tick)
+        })
+    }
+
+    /// Stops playback and releases every sounding note.
+    ///
+    /// This is the `Alt+.` panic routine (All Notes Off on every channel),
+    /// used when the *user* asks to stop: a stop can land mid-note, and a
+    /// pattern may end on a note-on with no room left for its note-off.
+    pub fn stop_playback_and_release(&mut self) {
+        if !self.playing {
+            return;
+        }
+        self.all_notes_off();
+        self.stop_playback();
+    }
+
+    /// How long until the next event is due, or `None` when not playing.
+    ///
+    /// The event loop sleeps for this long instead of a fixed frame interval,
+    /// so an event leaves when it is due rather than at the end of the next
+    /// frame. When no event is left, the answer is the time until the end of
+    /// the pattern, so the loop still wakes up to stop.
+    pub fn next_event_in(&self) -> Option<Duration> {
+        if !self.playing {
+            return None;
+        }
+        let tpb = self.project.composition.tpb();
+        let micros_per_tick = self.project.composition.bpm().micros_per_tick(tpb);
+        if micros_per_tick <= 0.0 {
+            return None;
+        }
+        let horizon = self.playback_horizon();
+        let next_tick = self
+            .play_events
+            .get(self.play_next)
+            .map_or(horizon, |event| event.tick)
+            .min(horizon);
+        let ticks = next_tick.saturating_sub(self.play_tick);
+        // `play_micros` already holds the fraction of a tick consumed so far.
+        let micros = ticks as f64 * micros_per_tick - self.play_micros;
+        Some(Duration::from_micros(micros.max(0.0) as u64))
     }
 
     /// Advances playback by a wall-clock delta, sending due events.
@@ -2545,12 +2618,16 @@ impl App {
         }
         self.play_micros += delta_micros as f64;
         let whole_ticks = (self.play_micros / micros_per_tick) as u64;
-        if whole_ticks == 0 {
-            return;
+        if whole_ticks > 0 {
+            self.play_micros -= whole_ticks as f64 * micros_per_tick;
+            self.play_tick += whole_ticks;
         }
-        self.play_micros -= whole_ticks as f64 * micros_per_tick;
-        self.play_tick += whole_ticks;
 
+        // Send whatever is due at the current tick, even when no whole tick
+        // elapsed: an event sitting exactly on the tick we are already at (the
+        // first event of the start row, say) must leave now rather than after
+        // another tick. `next_event_in` reports zero for that case, so returning
+        // early here would make the event loop spin.
         let mut due: Vec<Event> = Vec::new();
         while self.play_next < self.play_events.len()
             && self.play_events[self.play_next].tick <= self.play_tick
@@ -2564,8 +2641,11 @@ impl App {
         let row_len = row_ticks(tpb, self.pattern().lpb()).unwrap_or(1) as u64;
         self.play_current_row = (self.play_tick / row_len) as usize;
         // Stop at the end of the pattern, not when the last event has been
-        // sent: trailing empty rows still belong to the pattern.
-        if self.play_tick >= self.play_end_tick {
+        // sent: trailing empty rows still belong to the pattern. A longer child
+        // pattern would keep playing past this point, so only release when
+        // nothing else is still sounding.
+        if self.play_tick >= self.play_end_tick && !self.other_patterns_playing() {
+            self.all_notes_off();
             self.stop_playback();
         }
     }
@@ -3600,6 +3680,27 @@ mod tests {
     }
 
     #[test]
+    fn quitting_during_playback_releases_every_channel() {
+        let mut app = app_with(4, 1);
+        let backend = MockBackend::new(&["out"]);
+        let sent = backend.sent_handle();
+        let mut manager = OutputManager::new(Box::new(backend) as Box<dyn MidiBackend>);
+        manager.select(0).unwrap();
+        app.set_midi(manager);
+
+        app.start_playback();
+        app.handle_key(Key::ctrl(Code::Char('q')));
+        assert!(app.should_quit());
+        assert!(!app.is_playing());
+
+        let messages = sent.borrow().clone();
+        assert_eq!(messages.len(), 16);
+        for (channel, message) in messages.iter().enumerate() {
+            assert_eq!(message, &[0xB0 | channel as u8, 123, 0]);
+        }
+    }
+
+    #[test]
     fn ctrl_s_saves_without_typing_on_the_code_screen() {
         let mut app = app_with(4, 2);
         app.handle_key(Key::new(Code::Function(3)));
@@ -4048,6 +4149,112 @@ mod tests {
         app.handle_key(Key::new(Code::Function(3)));
         app.handle_key(Key::alt(Code::Char('.')));
         assert_eq!(sent.borrow().len(), 16);
+    }
+
+    #[test]
+    fn user_stop_releases_every_channel() {
+        // A user-initiated stop can land mid-note, so it must not leave notes
+        // hanging.
+        let mut app = app_with(4, 1);
+        let backend = MockBackend::new(&["out"]);
+        let sent = backend.sent_handle();
+        let mut manager = OutputManager::new(Box::new(backend) as Box<dyn MidiBackend>);
+        manager.select(0).unwrap();
+        app.set_midi(manager);
+
+        app.start_playback();
+        assert!(app.is_playing());
+        app.stop_playback_and_release();
+        assert!(!app.is_playing());
+
+        let messages = sent.borrow().clone();
+        assert_eq!(messages.len(), 16);
+        for (channel, message) in messages.iter().enumerate() {
+            assert_eq!(message, &[0xB0 | channel as u8, 123, 0]);
+        }
+
+        // Stopping an already stopped player sends nothing.
+        sent.borrow_mut().clear();
+        app.stop_playback_and_release();
+        assert!(sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn playback_end_releases_when_nothing_else_plays() {
+        // Reaching the end of the only playing pattern is a stop like any
+        // other, so a trailing note-on without a note-off must not ring.
+        let mut app = app_with(4, 1);
+        let backend = MockBackend::new(&["out"]);
+        let sent = backend.sent_handle();
+        let mut manager = OutputManager::new(Box::new(backend) as Box<dyn MidiBackend>);
+        manager.select(0).unwrap();
+        app.set_midi(manager);
+
+        app.start_playback();
+        assert!(!app.other_patterns_playing());
+        // 24 TPB / 4 LPB = 6 ticks per row, 4 rows = 24 ticks at 120 BPM.
+        app.tick_playback(1_000_000);
+        assert!(!app.is_playing());
+
+        let messages = sent.borrow().clone();
+        assert_eq!(messages.len(), 16);
+        for (channel, message) in messages.iter().enumerate() {
+            assert_eq!(message, &[0xB0 | channel as u8, 123, 0]);
+        }
+    }
+
+    #[test]
+    fn a_macro_child_keeps_playing_past_the_parents_last_row() {
+        // A macro can trigger the playback of any pattern, and the child keeps
+        // playing after the parent that started it ends. Playback must cover the
+        // child instead of stopping at the parent's last row, and it must not
+        // silence everything while the child is still sounding.
+        let mut app = app_with(2, 1);
+        let child = app.project.composition.create_pattern(4).unwrap();
+        {
+            let pattern = app.project.composition.pattern_mut(child).unwrap();
+            pattern.resize_rows(4).unwrap();
+            pattern.set_event(0, 0, note(60, 100));
+            pattern.set_event(3, 0, note(64, 100));
+        }
+        app.project
+            .composition
+            .pattern_mut(PatternId(0))
+            .unwrap()
+            .set_event(
+                0,
+                0,
+                Event::Macro(MacroCall::new(
+                    mtrak_core::event::macro_id::BUILTIN_TRIGGER,
+                    child.value(),
+                    0,
+                )),
+            );
+
+        let backend = MockBackend::new(&["out"]);
+        let sent = backend.sent_handle();
+        let mut manager = OutputManager::new(Box::new(backend) as Box<dyn MidiBackend>);
+        manager.select(0).unwrap();
+        app.set_midi(manager);
+
+        // 24 TPB / 4 LPB = 6 ticks per row: the parent is 2 rows (12 ticks), the
+        // child 4 rows (24 ticks). At 120 BPM a tick is ~20833 µs.
+        app.start_playback();
+        app.tick_playback(250_000);
+        assert!(app.is_playing(), "the child is still sounding");
+        assert!(app.other_patterns_playing());
+        assert!(
+            sent.borrow().iter().all(|message| message[1] != 123),
+            "the child must not be silenced when the parent ends"
+        );
+
+        app.tick_playback(250_000);
+        assert!(!app.is_playing(), "stops once the child is done");
+        assert!(!app.other_patterns_playing());
+        assert!(
+            sent.borrow().iter().any(|message| message[1] == 123),
+            "everything is released when the last pattern ends"
+        );
     }
 
     #[test]

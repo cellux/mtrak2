@@ -33,6 +33,15 @@ pub trait Sink {
 /// Default safety bound on the number of ticks a run may advance.
 pub const DEFAULT_MAX_TICK: Ticks = 10_000_000;
 
+/// Default safety bound on the number of patterns running at once.
+///
+/// A trigger can start any pattern, including one that (directly or through a
+/// cycle) triggers again. Without a bound such a composition would create
+/// instances forever: the inner loop in [`Engine::step`] never advances the
+/// tick, so the tick bound cannot stop it. Refusing to schedule past the bound
+/// keeps the run finite and reports the truncation.
+pub const DEFAULT_MAX_INSTANCES: usize = 1024;
+
 struct Instance {
     id: u64,
     pattern: PatternId,
@@ -40,7 +49,6 @@ struct Instance {
     row: usize,
     row_ticks: u32,
     owner: Option<(u64, usize)>,
-    children: Vec<Option<u64>>,
 }
 
 struct MacroInstance {
@@ -90,6 +98,7 @@ pub struct Engine {
     tempo: TempoMap,
     tick: Ticks,
     max_tick: Ticks,
+    max_instances: usize,
     overflowed: bool,
     next_id: u64,
     instances: Vec<Instance>,
@@ -110,6 +119,7 @@ impl Engine {
             tempo,
             tick: 0,
             max_tick: DEFAULT_MAX_TICK,
+            max_instances: DEFAULT_MAX_INSTANCES,
             overflowed: false,
             next_id: 1,
             instances: Vec::new(),
@@ -162,6 +172,20 @@ impl Engine {
         self.max_tick = max_tick;
     }
 
+    /// Sets the bound on how many patterns may run at once.
+    pub fn set_max_instances(&mut self, max_instances: usize) {
+        self.max_instances = max_instances;
+    }
+
+    /// Reports that a safety bound was hit, once per run.
+    fn refuse(&mut self, what: &str) -> bool {
+        if !self.overflowed {
+            self.overflowed = true;
+            self.diagnostics.push(what.to_string());
+        }
+        false
+    }
+
     /// Installs a factory for user macro coroutines.
     pub fn set_macro_factory(&mut self, factory: Box<dyn MacroFactory>) {
         self.factory = Some(factory);
@@ -174,6 +198,13 @@ impl Engine {
 
     /// Starts a root pattern instance at the current tick.
     pub fn start(&mut self, pattern: PatternId) -> bool {
+        if self.instances.len() >= self.max_instances {
+            return self.refuse(&format!(
+                "refusing to start pattern {}: {} patterns already running",
+                pattern.value(),
+                self.instances.len()
+            ));
+        }
         let Some(pat) = self.composition.pattern(pattern) else {
             return false;
         };
@@ -181,7 +212,6 @@ impl Engine {
             Ok(v) => v,
             Err(_) => return false,
         };
-        let tracks = pat.track_count();
         let id = self.next_id;
         self.next_id += 1;
         self.instances.push(Instance {
@@ -191,7 +221,6 @@ impl Engine {
             row: 0,
             row_ticks,
             owner: None,
-            children: vec![None; tracks],
         });
         true
     }
@@ -382,7 +411,7 @@ impl Engine {
             let owner_instance = self.macros[idx].instance;
             let owner_track = self.macros[idx].track;
             let settings = self.settings_for_instance(owner_instance);
-            let mut ctx = MacroCtx::new(self.tick, owner_track, settings);
+            let mut ctx = MacroCtx::new(self.tick, owner_track, self.composition.tpb(), settings);
             let wait = self.macros[idx].macro_.resume(&mut ctx);
             let actions = ctx.into_actions();
             results.push((seq, owner_instance, owner_track, wait, actions));
@@ -391,7 +420,9 @@ impl Engine {
             match wait {
                 Some(wait) => {
                     if let Some(m) = self.macros.iter_mut().find(|m| m.seq == seq) {
-                        m.next_run = self.tick + wait.max(1);
+                        // Saturate: a macro may request an arbitrarily long wait,
+                        // and `tick + wait` must not overflow.
+                        m.next_run = self.tick.saturating_add(wait.max(1));
                     }
                 }
                 None => self.macros.retain(|m| m.seq != seq),
@@ -447,9 +478,17 @@ impl Engine {
     }
 
     /// Triggers `pattern` on `track` of the instance `parent_id`, replacing any
-    /// child previously owned by that track (decision D-008). Coroutines are not
-    /// cancelled by replacement (decision D-026).
+    /// child previously owned by that track (decision D-032). The child keeps
+    /// playing after its parent ends; only an explicit replacement or stop
+    /// removes it. Coroutines are not cancelled by replacement (decision D-026).
     pub fn trigger(&mut self, parent_id: u64, track: usize, pattern: PatternId) -> bool {
+        if self.instances.len() >= self.max_instances {
+            return self.refuse(&format!(
+                "refusing to trigger pattern {}: {} patterns already running",
+                pattern.value(),
+                self.instances.len()
+            ));
+        }
         let Some(pat) = self.composition.pattern(pattern) else {
             return false;
         };
@@ -457,14 +496,25 @@ impl Engine {
             Ok(v) => v,
             Err(_) => return false,
         };
-        let tracks = pat.track_count();
-        let Some(parent_idx) = self.instances.iter().position(|i| i.id == parent_id) else {
+        let Some(parent_pattern) = self
+            .instances
+            .iter()
+            .find(|i| i.id == parent_id)
+            .map(|i| i.pattern)
+        else {
             return false;
         };
-        if track >= self.instances[parent_idx].children.len() {
+        let parent_tracks = self
+            .composition
+            .pattern(parent_pattern)
+            .map_or(0, |p| p.track_count());
+        if track >= parent_tracks {
             return false;
         }
-        if let Some(old) = self.instances[parent_idx].children[track].take() {
+        // A later trigger on the same track replaces the child it owns (D-008).
+        // The child is found by its back-reference, so replacement still works
+        // after the owner has ended.
+        if let Some(old) = self.child_of(parent_id, track) {
             self.remove_tree(old);
         }
         let id = self.next_id;
@@ -476,15 +526,19 @@ impl Engine {
             row: 0,
             row_ticks,
             owner: Some((parent_id, track)),
-            children: vec![None; tracks],
         });
-        // Re-locate the parent in case remove_tree shifted indices.
-        if let Some(parent_idx) = self.instances.iter().position(|i| i.id == parent_id) {
-            if track < self.instances[parent_idx].children.len() {
-                self.instances[parent_idx].children[track] = Some(id);
-            }
-        }
         true
+    }
+
+    /// The child instance currently owned by `track` of `parent`, if any.
+    ///
+    /// Ownership is a back-reference on the child rather than a list on the
+    /// parent, so a child keeps its owner name after the owner has ended.
+    fn child_of(&self, parent: u64, track: usize) -> Option<u64> {
+        self.instances
+            .iter()
+            .find(|inst| inst.owner == Some((parent, track)))
+            .map(|inst| inst.id)
     }
 
     /// Stops the child instance and coroutines associated with `track`.
@@ -499,12 +553,8 @@ impl Engine {
         include_current: bool,
         caller: Option<u64>,
     ) {
-        if let Some(idx) = self.instances.iter().position(|i| i.id == instance_id) {
-            if track < self.instances[idx].children.len() {
-                if let Some(child) = self.instances[idx].children[track].take() {
-                    self.remove_tree(child);
-                }
-            }
+        if let Some(child) = self.child_of(instance_id, track) {
+            self.remove_tree(child);
         }
         self.macros.retain(|m| {
             let same_track = m.instance == instance_id && m.track == track;
@@ -522,7 +572,10 @@ impl Engine {
     }
 
     fn remove_ended(&mut self) {
-        let ended: Vec<u64> = self
+        // A child keeps playing after its parent ends: only the instance that
+        // reached its final row is removed, not its descendants. An explicit
+        // stop or a replacement still removes the whole subtree.
+        let ended: HashSet<u64> = self
             .instances
             .iter()
             .filter(|inst| {
@@ -533,11 +586,7 @@ impl Engine {
             })
             .map(|inst| inst.id)
             .collect();
-        for id in ended {
-            if self.instances.iter().any(|i| i.id == id) {
-                self.remove_tree(id);
-            }
-        }
+        self.instances.retain(|inst| !ended.contains(&inst.id));
     }
 
     fn remove_tree(&mut self, root: u64) {
@@ -555,15 +604,6 @@ impl Engine {
             }
         }
         self.instances.retain(|i| !ids.contains(&i.id));
-        for inst in &mut self.instances {
-            for child in &mut inst.children {
-                if let Some(cid) = *child {
-                    if ids.contains(&cid) {
-                        *child = None;
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -691,7 +731,10 @@ mod tests {
     }
 
     #[test]
-    fn root_end_tears_down_its_children() {
+    fn a_child_keeps_playing_after_its_parent_ends() {
+        // The parent's last row no longer tears the child down: the child runs
+        // to its own final row. Only an explicit stop or a replacement removes
+        // a subtree.
         let mut composition = comp_with(1, 1, 4); // root ends at tick 6
         let child = composition.create_pattern(4).unwrap();
         {
@@ -708,13 +751,79 @@ mod tests {
         let mut engine = Engine::new(composition);
         engine.start(PatternId(0));
         engine.run();
-        assert_eq!(ticks_of(&engine, 60), vec![0]);
-        assert_eq!(
-            ticks_of(&engine, 61),
-            vec![6],
-            "tick at the root's end still fires"
+        // The child's rows land on ticks 0, 6, 12 and 18; the parent ends at 6.
+        for (key, tick) in [(60u8, 0), (61, 6), (62, 12), (63, 18)] {
+            assert_eq!(ticks_of(&engine, key), vec![tick], "key {key}");
+        }
+        assert!(!engine.overflowed());
+    }
+
+    #[test]
+    fn a_self_triggering_pattern_is_bounded_instead_of_hanging() {
+        // A pattern that triggers itself would create instances forever: the
+        // inner loop in `step` never advances the tick, so the tick bound cannot
+        // stop it. The instance bound keeps the run finite and reports it.
+        let mut composition = comp_with(1, 1, 4);
+        composition
+            .pattern_mut(PatternId(0))
+            .unwrap()
+            .set_event(0, 0, trigger(PatternId(0)));
+        let mut engine = Engine::new(composition);
+        engine.set_max_instances(8);
+        engine.start(PatternId(0));
+        engine.run();
+        assert!(engine.overflowed(), "the bound must be reported");
+        assert!(
+            engine
+                .diagnostics()
+                .iter()
+                .any(|line| line.contains("already running")),
+            "diagnostics: {:?}",
+            engine.diagnostics()
         );
-        assert!(ticks_of(&engine, 62).is_empty());
+    }
+
+    #[test]
+    fn a_trigger_cycle_is_bounded_too() {
+        // Two patterns triggering each other is the same runaway as a self
+        // trigger, so the same bound has to stop it.
+        let mut composition = comp_with(1, 1, 4);
+        let other = composition.create_pattern(4).unwrap();
+        {
+            let p = composition.pattern_mut(other).unwrap();
+            p.resize_rows(1).unwrap();
+            p.set_event(0, 0, trigger(PatternId(0)));
+        }
+        composition
+            .pattern_mut(PatternId(0))
+            .unwrap()
+            .set_event(0, 0, trigger(other));
+        let mut engine = Engine::new(composition);
+        engine.set_max_instances(16);
+        engine.start(PatternId(0));
+        engine.run();
+        assert!(engine.overflowed());
+    }
+
+    #[test]
+    fn a_legitimate_composition_stays_below_the_bound() {
+        // The bound must not get in the way of ordinary nested patterns.
+        let mut composition = comp_with(2, 2, 4);
+        let child = composition.create_pattern(4).unwrap();
+        {
+            let p = composition.pattern_mut(child).unwrap();
+            p.resize_rows(2).unwrap();
+            p.set_event(0, 0, note(72));
+        }
+        composition
+            .pattern_mut(PatternId(0))
+            .unwrap()
+            .set_event(0, 0, trigger(child));
+        let mut engine = Engine::new(composition);
+        engine.start(PatternId(0));
+        engine.run();
+        assert!(!engine.overflowed());
+        assert!(engine.diagnostics().is_empty());
     }
 
     #[test]

@@ -50,16 +50,20 @@ pub struct MacroCtx {
     pub tick: Ticks,
     /// The track that invoked the macro.
     pub track: usize,
+    /// The composition's ticks per beat, used to convert beat-denominated
+    /// macro waits into ticks.
+    tpb: u32,
     settings: Settings,
     actions: Vec<MacroAction>,
 }
 
 impl MacroCtx {
     /// Creates a context for a macro resumed at `tick` on `track`.
-    pub fn new(tick: Ticks, track: usize, settings: Settings) -> Self {
+    pub fn new(tick: Ticks, track: usize, tpb: u32, settings: Settings) -> Self {
         MacroCtx {
             tick,
             track,
+            tpb,
             settings,
             actions: Vec::new(),
         }
@@ -68,6 +72,11 @@ impl MacroCtx {
     /// The effective settings visible to the macro.
     pub fn settings(&self) -> Settings {
         self.settings
+    }
+
+    /// The composition's ticks per beat.
+    pub fn tpb(&self) -> u32 {
+        self.tpb
     }
 
     /// Requests that `event` be emitted at the current tick.

@@ -587,7 +587,10 @@ impl LuaMacro {
                     finish(&self.inner);
                     Ok((ResumeOutcome::Finished, actions))
                 } else {
-                    Ok((ResumeOutcome::Wait(yield_ticks(&values)), actions))
+                    Ok((
+                        ResumeOutcome::Wait(yield_ticks(&values, ctx.tpb())),
+                        actions,
+                    ))
                 }
             }
             Err(mlua::Error::CoroutineUnresumable) => {
@@ -636,13 +639,28 @@ fn context_table(lua: &Lua, settings: Settings, track: usize, tick: Ticks) -> ml
     Ok(context)
 }
 
-fn yield_ticks(values: &MultiValue) -> Ticks {
-    values
+/// Converts a `wait` argument from beats into ticks.
+///
+/// `wait(n)` counts *beats*, not ticks, so a macro's timing is independent of
+/// the file's TPB: the same source behaves identically in a TPB=24 project and
+/// a TPB=960 one. Fractional beats are allowed, so `wait(0.25)` is a sixteenth
+/// note in 4/4. The result is clamped to at least one tick, because a zero wait
+/// would resume the coroutine forever within the same tick.
+fn yield_ticks(values: &MultiValue, tpb: u32) -> Ticks {
+    let beats = values
         .front()
-        .and_then(Value::as_integer)
-        .map(|v| v.max(0) as Ticks)
-        .unwrap_or(1)
-        .max(1)
+        .and_then(|value| match value {
+            Value::Integer(beats) => Some(*beats as f64),
+            Value::Number(beats) => Some(*beats),
+            _ => None,
+        })
+        .unwrap_or(1.0);
+    let ticks = (beats * f64::from(tpb)).round();
+    if ticks >= 1.0 {
+        ticks as Ticks
+    } else {
+        1
+    }
 }
 
 fn channel_event(status: u8, data1: Option<u8>, data2: Option<u8>) -> Event {
@@ -759,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn macros_emit_and_wait_in_global_ticks() {
+    fn macros_emit_and_wait_in_beats() {
         let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
         runtime
             .load_module(
@@ -774,8 +792,42 @@ mod tests {
             )
             .unwrap();
         let engine = run(pattern_with_macro(0x41, 60, 62), &runtime);
-        assert_eq!(notes(&engine), vec![(0, 0, 60), (4, 1, 62)]);
+        // TPB is 24, so wait(4) is four beats, i.e. 96 ticks.
+        assert_eq!(notes(&engine), vec![(0, 0, 60), (96, 1, 62)]);
         assert!(engine.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn wait_is_independent_of_tpb() {
+        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        runtime
+            .load_module(
+                0x44,
+                r#"
+                return { run = function(a1, a2, ctx)
+                    emit(0x90, a1, 100)
+                    wait(1)
+                    emit(0x91, a2, 100)
+                end }
+                "#,
+            )
+            .unwrap();
+        let mut positions = Vec::new();
+        for tpb in [24u32, 96] {
+            let mut composition = pattern_with_macro(0x44, 60, 62);
+            composition.raise_tpb(tpb).unwrap();
+            let engine = run(composition, &runtime);
+            positions.push(
+                notes(&engine)
+                    .into_iter()
+                    .map(|(tick, _, _)| tick)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        // One beat apart in both projects, so the tick gap scales with TPB
+        // instead of the wait shrinking as the resolution grows.
+        assert_eq!(positions[0], vec![0, 24]);
+        assert_eq!(positions[1], vec![0, 96]);
     }
 
     #[test]
@@ -794,7 +846,8 @@ mod tests {
             )
             .unwrap();
         let engine = run(pattern_with_macro(0x42, 0, 0), &runtime);
-        assert_eq!(notes(&engine), vec![(2, 0, 99)]);
+        // wait(2) is two beats, i.e. 48 ticks at TPB 24.
+        assert_eq!(notes(&engine), vec![(48, 0, 99)]);
     }
 
     #[test]

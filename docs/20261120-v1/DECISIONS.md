@@ -62,16 +62,20 @@ All previously open decisions below were accepted as written before implementati
 
 ### D-008 — Track-local child ownership
 
-- Status: Accepted
+- Status: Superseded
+- Superseded by: D-032
 - Decision: a trigger on a parent track starts a child owned by that track; a later trigger on the same track replaces that instance and its descendants while the parent and its other tracks keep running.
 - Source: `PLAN.md` §2.2.
 - Consequence: coroutine lifetime is more flexible than pattern ownership (see D-026).
+- Superseded because: the parent's final row also tore the child down, which truncated a longer child mid-note. D-032 keeps the ownership back-reference but removes the teardown.
 
 ### D-009 — TPB is the single global clock and canonical resolution
 
-- Status: Accepted
+- Status: Superseded
+- Superseded by: D-034
 - Decision: BPM and TPB are composition-wide; TPB is the canonical MIDI resolution and the single scheduler clock; each pattern's LPB must divide TPB exactly and a row lasts `TPB / LPB` ticks. `wait(n)` counts global ticks.
 - Source: `PLAN.md` §2.1, §2.4.
+- Superseded because: the clock and row-length rules survive in D-034, but `wait(n)` counting ticks makes a macro's timing depend on the file's TPB. D-034 re-denominates waits in beats.
 
 ### D-010 — Live settings inheritance
 
@@ -212,3 +216,39 @@ All previously open decisions below were accepted as written before implementati
 - Question: how the inline six-character hex editor distinguishes an omitted byte from an explicitly supplied `00`, given `·` denotes an empty nibble.
 - Resolution: the inline editor exposes only the three-byte message fields; a distinct visual/kinetic affordance (e.g. an explicit-clear vs set-to-zero input) toggles presence, and the complex editor (D-027) can always set presence unambiguously; tests assert the distinction survives edit→render→reload.
 - Related: D-023.
+
+### D-032 — Child patterns outlive their parent
+
+- Status: Accepted
+- Question: when a trigger's child pattern runs longer than the parent that started it, should the parent's final row tear the child down?
+- Resolution: no. A child runs to its own final row; the parent reaching its last row removes only the parent instance. Ownership remains a back-reference on the child, used for replacement and explicit stops, but no longer implies teardown. A replacement or an explicit `stop_track` still removes the whole subtree.
+- Source: found while comparing mtrak's playback against fluidsynth's own player; `PLAN.md` §2.2.
+- Supersedes: D-008's teardown behaviour.
+- Consequence: playback must cover the whole timeline, not just the parent's rows, and the end-of-playback release fires only when nothing is left to sound.
+
+### D-033 — Bound on simultaneously running patterns
+
+- Status: Accepted
+- Question: what stops a trigger that starts a pattern which triggers another, ad infinitum — a self-trigger or a cycle?
+- Resolution: the engine refuses to start or trigger past `DEFAULT_MAX_INSTANCES` (1024, configurable through `set_max_instances`), and reports the truncation through `overflowed()` and a diagnostic.
+- Source: a probe during the same comparison; a self-triggering pattern hung `Engine::run` indefinitely.
+- Rationale: the tick bound cannot help, because the runaway happens inside a single tick — `step` loops without advancing the tick, so `max_tick` never fires. With D-032 in force the instance bound is also the only bound on total instances, since a parent's end no longer releases its children.
+- Consequence: a recursive composition is truncated and reported rather than hanging; ordinary compositions stay far below the bound.
+
+### D-034 — Macro waits count beats, not ticks
+
+- Status: Accepted
+- Question: what unit should `wait(n)` use, given that TPB varies by an order of magnitude between files (24 in a fresh project, 960 in some imported ones)?
+- Resolution: `wait(n)` counts beats. It is converted to ticks as `round(n * TPB)` and clamped to at least one tick. Fractional beats are allowed, so `wait(0.25)` is a sixteenth note in 4/4. The surviving rules of D-009 are unchanged: TPB is still the single scheduler clock, each pattern's LPB still divides TPB, and a row still lasts `TPB / LPB` ticks.
+- Source: comparing mtrak's playback against fluidsynth's own player; a TPB=960 import made tick-denominated waits 40x denser than a TPB=24 project.
+- Rationale: TPB is an export resolution, not a musical quantity. A tick-denominated wait makes the same macro source behave differently in a TPB=24 and a TPB=960 project — `wait(4)` is 83 ms in one and 2 ms in the other. Beats are TPB-independent and, unlike rows, also independent of the invoking pattern's LPB.
+- Consequence: the injected `wait` API is denominated in beats while the tick timeline remains the clock. A macro that used `wait(1)` to mean "the next tick" now waits a beat and must be rewritten.
+
+### D-035 — TPB is normalised on import when the row grid allows it
+
+- Status: Accepted
+- Question: should a standard MIDI file's PPQ be kept as the project TPB, even at 480 or 960?
+- Resolution: reduce it. The import divides the TPB by the largest factor `k` that divides every event tick, taking the largest reachable resolution at or below `TARGET_TPB = 96`; when none is reachable it takes the smallest reachable resolution at or above `MIN_TPB = 24`; when neither exists it keeps the file's TPB. All ticks are scaled by `1/k`.
+- Source: the same comparison; TPB=480 and 960 imports drive the engine clock 20-40x faster than a TPB=24 project.
+- Rationale: `k` dividing every event tick is exactly the row-boundary constraint — an event's row is `tick / row_ticks` and its offset is `tick % row_ticks`, and both scale by `1/k`, so no event leaves the row it started on. Reducing further would push events off their rows or move them in time. The engine's step cost is `O(instances x tracks)` per tick, so a dense clock multiplies the cost of every running pattern and every tick-granular macro.
+- Consequence: foreign files at TPB=480 or 960 import at 96 when their events allow it; files whose events sit on odd ticks keep their original resolution. mtrak's own saved projects are unaffected, because they round-trip through the metadata chunk rather than the standard import.

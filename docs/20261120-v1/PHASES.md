@@ -166,14 +166,14 @@ This file turns the milestone specification in `PLAN.md` into an ordered set of 
 - Strict sandbox: no filesystem, network, process, unrestricted host objects, `os`, `io`, `debug`, `package`, or FFI.
 - Module loading and the fixed entry point `run(arg1, arg2, context)`.
 - Built-in macro `01` (trigger pattern `arg1`) and `02` (Q8.8 tempo shorthand); undefined built-ins reserved and rejected; user macros `40`–`7F`; `00` reserved for the setup module.
-- Injected API: emit MIDI/custom events; `wait(n)` in global ticks; trigger child patterns; `stop_track(include_current)`; read/change permitted global/pattern settings; register project-local TUI commands.
+- Injected API: emit MIDI/custom events; `wait(n)` in beats; trigger child patterns; `stop_track(include_current)`; read/change permitted global/pattern settings; register project-local TUI commands.
 - Setup module `00` executed automatically at project load; project-specific `:` commands registered.
 - Practical instruction/time and allocation limits with bounded, isolated failure behavior.
 
 **Acceptance criteria.**
 - Tests confirm the sandbox blocks filesystem, network, process, `os`, `io`, `debug`, `package`, and FFI access.
 - Built-ins `01`/`02` behave as specified; undefined built-in IDs are rejected; user IDs `40`–`7F` load and run.
-- `wait(n)` counts global ticks and is independent of the invoking pattern's LPB.
+- `wait(n)` counts beats and is independent of both the composition's TPB and the invoking pattern's LPB.
 - A failing/over-budget macro cannot corrupt engine state; errors are reported and bounded.
 - Setup module auto-runs and its registered commands appear only in the TUI, per D-025.
 

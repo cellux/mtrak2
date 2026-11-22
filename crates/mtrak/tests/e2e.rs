@@ -59,7 +59,9 @@ fn committed_fixtures_import_without_hardware() {
     );
 
     let multi = smf::load(include_bytes!("fixtures/multitrack.mid")).unwrap();
-    assert_eq!(multi.project.composition.tpb(), 480);
+    // The fixture declares 480 PPQ but every event sits on a beat boundary, so
+    // import reduces the resolution to 96 without moving anything.
+    assert_eq!(multi.project.composition.tpb(), 96);
     // Two simultaneous source notes must be split into two tracker tracks.
     assert!(
         multi
