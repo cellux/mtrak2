@@ -133,12 +133,57 @@ Verification: `cargo fmt --all -- --check` clean;
 `cargo clippy --workspace --all-targets -- -D warnings` clean;
 `cargo test --workspace` 289 tests.
 
+## 2026-11-22T20:19:24Z — Lighter EDIT-mode brush background
+
+Lightened the EDIT-mode brush background from `rgb(0, 24, 48)` to
+`rgb(0, 48, 96)`. It remains clearly darker than the cursor's blue and than
+terminal white text. Moved the brush, selection, and overlap colors into named
+constants (`BRUSH_BG`, `SELECTION_BG`, `BRUSH_SELECTION_BG`) so the hierarchy is
+explicit and easier to tune.
+
+Verification: `cargo fmt --all -- --check` clean;
+`cargo clippy --workspace --all-targets -- -D warnings` clean;
+`cargo test --workspace` 289 tests.
+
+## 2026-11-22T20:27:03Z — Cursor-aligned brush stages and brush-step movement
+
+Reworked the EDIT brush geometry and navigation (PR-012). Horizontal growth is
+now `one nibble -> byte containing the cursor -> cell containing the cursor ->
+entire row`; with offsets visible, the cell stage is the offset-inclusive
+`Ten` width and the event-only `Six` stage is skipped. The byte/cell stages
+align to the cursor's containing byte/cell instead of starting at the cursor
+and shifting at the pattern edge. Vertical growth is `one row -> the LPB block
+anchored at floor(row/LPB)*LPB -> the whole pattern height`. EDIT arrow keys
+now move by the brush width/height; typing still advances one nibble and
+PLAY/REC navigation is unchanged. Added tests for the expansion stages, offset
+visibility, LPB alignment, and brush-sized movement.
+
+Verification: `cargo fmt --all -- --check` clean;
+`cargo clippy --workspace --all-targets -- -D warnings` clean;
+`cargo test --workspace` 293 tests.
+
+## 2026-11-22T20:31:34Z — Cell-wide brush selections extend by whole cells
+
+Fixed the asymmetric selection behavior with a cell-wide brush (PR-013). The
+initial selection bounds for `Six`/`Ten` brushes now cover the whole cell
+containing the anchor instead of being byte-rounded from the anchor, and
+`shrink_horizontal` reverses by whole cells for those brushes. `Shift+Left` and
+`Shift+Right` are now symmetric: the first press selects the anchor cell and
+each later press adds/removes one whole cell. One-nibble and byte-wide brushes
+keep their documented byte-level behavior. Added a regression test covering
+left/right growth, reversal, and the offset-inclusive cell stage.
+
+Verification: `cargo fmt --all -- --check` clean;
+`cargo clippy --workspace --all-targets -- -D warnings` clean;
+`cargo test --workspace` 294 tests.
+
 ## HANDOFF
 
 **State:** The PLAY/REC/EDIT milestone is implemented and green, including a
 yellow start-row marker, a session keyboard transpose (`F7`/`F8`,
-`:transpose`), pattern LPB in the header, and the `.` cell clear in every
-musical mode. No pending work is known.
+`:transpose`), pattern LPB in the header, the `.` cell clear in every musical
+mode, cursor-aligned brush stages with brush-step EDIT movement, and
+cell-aligned selection growth. No pending work is known.
 
 **Durable decisions:** PR-001…PR-010 in `DECISIONS.md`.
 

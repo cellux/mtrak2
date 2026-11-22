@@ -40,6 +40,12 @@ const PLAY_ROW_MARK: char = '▶';
 const START_ROW_MARK: char = '▶';
 /// Foreground of the playback start-row marker.
 const START_ROW_FG: Color = Color::Yellow;
+/// Background of the brush (edit-mode cursor rectangle).
+const BRUSH_BG: Color = Color::Rgb(0, 48, 96);
+/// Background of a selection outside the brush.
+const SELECTION_BG: Color = Color::Rgb(0, 40, 90);
+/// Background where the brush and selection overlap.
+const BRUSH_SELECTION_BG: Color = Color::Rgb(0, 56, 108);
 /// Separates the hex coordinate labels of the chooser grid.
 const CHOOSER_MARK: char = '·';
 /// Background of the row/column a partially typed chooser byte selects.
@@ -355,9 +361,9 @@ fn draw_pattern(frame: &mut Frame, app: &App, area: Area) {
                     .unwrap_or(false);
                 let in_brush = column.map(|c| brush.contains(row, c)).unwrap_or(false);
                 let mut style = match (in_selection, in_brush) {
-                    (true, true) => Style::default().bg(Color::Rgb(0, 56, 108)),
-                    (true, false) => Style::default().bg(Color::Rgb(0, 40, 90)),
-                    (false, true) => Style::default().bg(Color::Rgb(0, 24, 48)),
+                    (true, true) => Style::default().bg(BRUSH_SELECTION_BG),
+                    (true, false) => Style::default().bg(SELECTION_BG),
+                    (false, true) => Style::default().bg(BRUSH_BG),
                     (false, false) => Style::default(),
                 };
                 if invalid_offset && i > 6 {

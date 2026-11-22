@@ -152,3 +152,36 @@ decision.
   the `.` clear; every other gate remains in force. Clearing cannot accidentally
   become a partial byte edit in PLAY/REC.
 - Source: follow-up request; supersedes the `.` portion of PR-010.
+
+### PR-012 — Cursor-aligned brush stages and brush-step movement
+
+- Status: Accepted
+- Decision: the EDIT brush expands horizontally as one nibble, the byte
+  containing the cursor, the cell containing the cursor (the whole cell
+  including offsets when they are visible), then the entire row. The byte and
+  cell stages align to the byte/cell containing the logical cursor rather than
+  starting at the cursor and shifting at the pattern edge. Vertically the LPB
+  stage spans the block anchored at `floor(row / LPB) * LPB`; the next stage is
+  the entire pattern height. EDIT arrow movement advances the cursor by the
+  current brush width horizontally and brush height vertically; typing still
+  advances one nibble, and PLAY/REC navigation is unchanged.
+- Consequence: the brush no longer shifts its origin at the right/bottom edge;
+  the older SB-001 edge-shift behavior and SB-002 width cycle are superseded
+  for EDIT. `Ten` remains available only with offsets visible and means the
+  whole offset-inclusive cell; growth skips the event-only `Six` stage when
+  offsets are visible.
+- Source: follow-up request.
+### PR-013 — Cell-wide brush selections are cell aligned
+
+- Status: Accepted
+- Decision: when a selection starts with a cell-wide brush (`Six` with
+  offsets hidden, `Ten` with offsets visible, or any wider stage), its initial
+  horizontal bounds cover the whole cell containing the anchor rather than the
+  byte containing the anchor. Growth and reversal shrink/expand by whole cells
+  for that brush. Byte-wide and one-nibble brushes keep their byte-level
+  selection behavior.
+- Consequence: `Shift+Left` and `Shift+Right` are symmetric for cell-wide
+  brushes: the first press selects the anchor cell, and each later press adds
+  or removes one whole cell. A cell-wide brush no longer produces a partial
+  byte-sized selection step before the cell stage.
+- Source: follow-up bug report against PR-012.

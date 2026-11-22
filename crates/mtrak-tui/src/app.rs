@@ -142,6 +142,7 @@ impl BrushWidth {
     pub fn grow(self, offsets_visible: bool) -> Self {
         match self {
             BrushWidth::One => BrushWidth::Two,
+            BrushWidth::Two if offsets_visible => BrushWidth::Ten,
             BrushWidth::Two => BrushWidth::Six,
             BrushWidth::Six if offsets_visible => BrushWidth::Ten,
             BrushWidth::Six => BrushWidth::Full,
@@ -156,7 +157,7 @@ impl BrushWidth {
             BrushWidth::One => BrushWidth::One,
             BrushWidth::Two => BrushWidth::One,
             BrushWidth::Six => BrushWidth::Two,
-            BrushWidth::Ten => BrushWidth::Six,
+            BrushWidth::Ten => BrushWidth::Two,
             BrushWidth::Full if offsets_visible => BrushWidth::Ten,
             BrushWidth::Full => BrushWidth::Six,
         }
@@ -662,37 +663,50 @@ impl App {
 
     /// The inclusive brush rectangle derived from the logical cursor.
     ///
-    /// The brush origin shifts backward at the right and bottom pattern edges
-    /// so the rectangle stays fully inside the pattern; the logical cursor is
-    /// never moved by this adjustment.
+    /// Horizontal stages are cursor-aligned: one nibble, the byte containing
+    /// the cursor, the event cell containing the cursor (or the whole cell with
+    /// offsets when they are visible), and the entire row. The LPB height stage
+    /// spans the LPB block that starts at the last multiple of LPB at or before
+    /// the cursor row; the full height stage spans the whole pattern.
     pub fn brush_rect(&self) -> Rect {
         let npc = self.nibbles_per_cell().max(1);
         let (rows, tracks) = self.pattern_geometry();
         let rows = rows.max(1);
         let tracks = tracks.max(1);
         let total_cols = tracks * npc;
-        let width = self.brush_width.nibbles(npc, tracks).clamp(1, total_cols);
-        let height = self
-            .brush_height
-            .cells(self.pattern().lpb() as usize, rows)
-            .clamp(1, rows);
         let cursor_col = self.cursor_column().min(total_cols - 1);
-        let start_col = if cursor_col + width > total_cols {
-            total_cols - width
-        } else {
-            cursor_col
-        };
         let cursor_row = self.row.min(rows - 1);
-        let start_row = if cursor_row + height > rows {
-            rows - height
-        } else {
-            cursor_row
+        let (left, right) = match self.brush_width {
+            BrushWidth::One => (cursor_col, cursor_col),
+            BrushWidth::Two => {
+                let left = cursor_col & !1;
+                (left, (left + 1).min(total_cols - 1))
+            }
+            BrushWidth::Six => {
+                let left = (cursor_col / npc) * npc;
+                (left, (left + 5).min(total_cols - 1))
+            }
+            BrushWidth::Ten => {
+                let left = (cursor_col / npc) * npc;
+                let span = if self.offsets_visible { 10 } else { 6 };
+                (left, (left + span - 1).min(total_cols - 1))
+            }
+            BrushWidth::Full => (0, total_cols - 1),
+        };
+        let lpb = (self.pattern().lpb() as usize).max(1);
+        let (top, bottom) = match self.brush_height {
+            BrushHeight::One => (cursor_row, cursor_row),
+            BrushHeight::Lpb => {
+                let top = (cursor_row / lpb) * lpb;
+                (top, (top + lpb - 1).min(rows - 1))
+            }
+            BrushHeight::Full => (0, rows - 1),
         };
         Rect {
-            top: start_row,
-            bottom: start_row + height - 1,
-            left: start_col,
-            right: start_col + width - 1,
+            top,
+            bottom,
+            left,
+            right,
         }
     }
 
@@ -830,6 +844,36 @@ impl App {
         }
     }
 
+    /// Moves the logical cursor horizontally by the current brush width.
+    fn move_horizontal_brush(&mut self, direction: isize) {
+        let npc = self.nibbles_per_cell().max(1);
+        let (_, tracks) = self.pattern_geometry();
+        let total = tracks.saturating_mul(npc).max(1);
+        let width = self.brush_width.nibbles(npc, tracks).max(1);
+        let current = self.cursor_column().min(total - 1);
+        let target = if direction < 0 {
+            current.saturating_sub(width)
+        } else {
+            current.saturating_add(width).min(total - 1)
+        };
+        self.set_cursor_column(target);
+    }
+
+    /// Moves the logical cursor vertically by the current brush height.
+    fn move_vertical_brush(&mut self, direction: isize) {
+        let (rows, _) = self.pattern_geometry();
+        let rows = rows.max(1);
+        let height = self
+            .brush_height
+            .cells(self.pattern().lpb() as usize, rows)
+            .max(1);
+        if direction < 0 {
+            self.row = self.row.saturating_sub(height);
+        } else {
+            self.row = self.row.saturating_add(height).min(rows - 1);
+        }
+    }
+
     /// Applies a navigation or editing action.
     pub fn apply(&mut self, action: Action) {
         // Workspace-independent actions.
@@ -874,6 +918,8 @@ impl App {
                 if self.mode.follows_playback() {
                     // PLAY/REC navigate whole tracks and keep the nibble.
                     self.track = self.track.saturating_sub(1);
+                } else if editing {
+                    self.move_horizontal_brush(-1);
                 } else {
                     self.move_left();
                 }
@@ -883,6 +929,8 @@ impl App {
                 self.cancel_selection();
                 if self.mode.follows_playback() {
                     self.track = (self.track + 1).min(tracks.saturating_sub(1));
+                } else if editing {
+                    self.move_horizontal_brush(1);
                 } else {
                     self.move_right();
                 }
@@ -890,12 +938,20 @@ impl App {
             }
             Action::MoveUp => {
                 self.cancel_selection();
-                self.row = self.row.saturating_sub(1);
+                if editing {
+                    self.move_vertical_brush(-1);
+                } else {
+                    self.row = self.row.saturating_sub(1);
+                }
                 self.sync_edit();
             }
             Action::MoveDown => {
                 self.cancel_selection();
-                self.row = (self.row + 1).min(rows.saturating_sub(1));
+                if editing {
+                    self.move_vertical_brush(1);
+                } else {
+                    self.row = (self.row + 1).min(rows.saturating_sub(1));
+                }
                 self.sync_edit();
             }
             Action::PageUp => {
@@ -1072,16 +1128,27 @@ impl App {
             .brush_height
             .cells(self.pattern().lpb() as usize, rows)
             .max(1);
-        let left = anchor_col & !1;
-        // Growing right from the second nibble of a one-nibble brush includes
-        // the following byte, matching the documented examples. Growing left
-        // keeps the anchor's own byte.
-        let right = if dcol > 0 && brush_width == 1 && anchor_col % 2 == 1 {
-            (anchor_col + 1) | 1
-        } else {
-            (anchor_col + brush_width - 1) | 1
+        // Cell-wide brushes start on the whole cell containing the anchor so
+        // that growing left and right moves by whole cells symmetrically. The
+        // narrower stages keep the byte-aligned behavior.
+        let (left, right) = match self.brush_width {
+            BrushWidth::Six | BrushWidth::Ten => {
+                let left = (anchor_col / npc) * npc;
+                (left, (left + brush_width - 1).min(total_cols - 1))
+            }
+            _ => {
+                let left = anchor_col & !1;
+                // Growing right from the second nibble of a one-nibble brush
+                // includes the following byte, matching the documented
+                // examples. Growing left keeps the anchor's own byte.
+                let right = if dcol > 0 && brush_width == 1 && anchor_col % 2 == 1 {
+                    (anchor_col + 1) | 1
+                } else {
+                    (anchor_col + brush_width - 1) | 1
+                };
+                (left, right.min(total_cols - 1))
+            }
         };
-        let right = right.min(total_cols - 1);
         let bottom = (anchor_row + brush_height - 1).min(rows - 1);
         let hdir = dcol.signum();
         let vdir = drow.signum();
@@ -3361,21 +3428,30 @@ fn grow_horizontal(selection: &mut Selection, dir: isize, cell: usize, total_col
 /// Returns whether an extension remains on the extended side.
 fn shrink_horizontal(selection: &mut Selection) -> bool {
     let anchor_col = selection.anchor.1;
-    let anchor_byte_start = anchor_col & !1;
-    let anchor_byte_end = anchor_col | 1;
+    let cell = selection.cell_nibbles.max(1);
+    // Cell-wide brushes shrink by whole cells; narrower brushes keep the
+    // byte-by-byte behavior.
+    let (target_start, target_end, step) = if selection.brush_width >= cell {
+        let start = anchor_col / cell * cell;
+        (start, start + cell - 1, cell)
+    } else {
+        (anchor_col & !1, anchor_col | 1, 2)
+    };
     match selection.hdir.cmp(&0) {
         std::cmp::Ordering::Greater => {
-            if selection.bounds.right > anchor_byte_end {
-                selection.bounds.right = (selection.bounds.right - 2).max(anchor_byte_end);
-                selection.bounds.right > anchor_byte_end
+            if selection.bounds.right > target_end {
+                selection.bounds.right =
+                    selection.bounds.right.saturating_sub(step).max(target_end);
+                selection.bounds.right > target_end
             } else {
                 false
             }
         }
         std::cmp::Ordering::Less => {
-            if selection.bounds.left < anchor_byte_start {
-                selection.bounds.left = (selection.bounds.left + 2).min(anchor_byte_start);
-                selection.bounds.left < anchor_byte_start
+            if selection.bounds.left < target_start {
+                selection.bounds.left =
+                    selection.bounds.left.saturating_add(step).min(target_start);
+                selection.bounds.left < target_start
             } else {
                 false
             }
@@ -5452,7 +5528,7 @@ mod tests {
     }
 
     #[test]
-    fn brush_shifts_origin_at_edges_without_moving_the_cursor() {
+    fn brush_aligns_to_the_cursor_cell_and_full_height() {
         let mut app = app_with(4, 2);
         app.track = 1;
         app.nibble = 0;
@@ -5476,6 +5552,135 @@ mod tests {
         let brush = app.brush_rect();
         assert_eq!((brush.top, brush.bottom), (0, 3));
         assert_eq!(app.cursor().0, 3, "the cursor stays at the requested row");
+    }
+
+    #[test]
+    fn brush_width_expands_to_the_cursor_byte_cell_then_row() {
+        let mut app = app_with(8, 2);
+        app.nibble = 3;
+        app.apply(Action::BrushWider);
+        assert_eq!(app.brush_width(), BrushWidth::Two);
+        assert_eq!(
+            app.brush_rect(),
+            Rect {
+                top: 0,
+                bottom: 0,
+                left: 2,
+                right: 3
+            },
+            "the byte containing nibble 3"
+        );
+
+        app.apply(Action::BrushWider);
+        assert_eq!(app.brush_width(), BrushWidth::Six);
+        assert_eq!(
+            app.brush_rect(),
+            Rect {
+                top: 0,
+                bottom: 0,
+                left: 0,
+                right: 5
+            },
+            "the cell containing nibble 3"
+        );
+
+        app.apply(Action::BrushWider);
+        assert_eq!(app.brush_width(), BrushWidth::Full);
+        assert_eq!(app.brush_rect().left, 0);
+        assert_eq!(app.brush_rect().right, 11, "the whole row");
+
+        app.apply(Action::BrushNarrower);
+        assert_eq!(app.brush_width(), BrushWidth::Six);
+        app.apply(Action::BrushNarrower);
+        assert_eq!(app.brush_width(), BrushWidth::Two);
+        assert_eq!((app.brush_rect().left, app.brush_rect().right), (2, 3));
+        app.apply(Action::BrushNarrower);
+        assert_eq!(app.brush_width(), BrushWidth::One);
+        assert_eq!((app.brush_rect().left, app.brush_rect().right), (3, 3));
+    }
+
+    #[test]
+    fn brush_width_skips_the_event_only_stage_when_offsets_are_visible() {
+        let mut app = app_with(8, 2);
+        app.apply(Action::ToggleOffsets);
+        app.nibble = 3;
+        app.apply(Action::BrushWider);
+        assert_eq!(app.brush_width(), BrushWidth::Two);
+        assert_eq!((app.brush_rect().left, app.brush_rect().right), (2, 3));
+        app.apply(Action::BrushWider);
+        assert_eq!(app.brush_width(), BrushWidth::Ten);
+        assert_eq!(
+            (app.brush_rect().left, app.brush_rect().right),
+            (0, 9),
+            "the whole cell including its offset"
+        );
+        app.apply(Action::BrushWider);
+        assert_eq!(app.brush_width(), BrushWidth::Full);
+        assert_eq!(
+            (app.brush_rect().left, app.brush_rect().right),
+            (0, 19),
+            "the whole row"
+        );
+    }
+
+    #[test]
+    fn brush_height_expands_to_the_aligned_lpb_block_then_the_pattern() {
+        let mut app = app_with(8, 1);
+        app.row = 5;
+        app.apply(Action::BrushTaller);
+        assert_eq!(app.brush_height(), BrushHeight::Lpb);
+        assert_eq!(
+            (app.brush_rect().top, app.brush_rect().bottom),
+            (4, 7),
+            "the LPB block starting at row 4"
+        );
+        assert_eq!(app.cursor().0, 5, "the cursor is unchanged");
+
+        app.apply(Action::BrushTaller);
+        assert_eq!(app.brush_height(), BrushHeight::Full);
+        assert_eq!(
+            (app.brush_rect().top, app.brush_rect().bottom),
+            (0, 7),
+            "the whole pattern height"
+        );
+
+        app.apply(Action::BrushShorter);
+        assert_eq!(app.brush_height(), BrushHeight::Lpb);
+        app.apply(Action::BrushShorter);
+        assert_eq!(app.brush_height(), BrushHeight::One);
+        assert_eq!((app.brush_rect().top, app.brush_rect().bottom), (5, 5));
+    }
+
+    #[test]
+    fn edit_cursor_moves_in_brush_sized_steps() {
+        let mut app = app_with(16, 2);
+        app.apply(Action::BrushWider);
+        assert_eq!(app.brush_width(), BrushWidth::Two);
+        app.apply(Action::MoveRight);
+        assert_eq!(app.cursor(), (0, 0, 2));
+        app.apply(Action::MoveRight);
+        assert_eq!(app.cursor(), (0, 0, 4));
+        app.apply(Action::MoveRight);
+        assert_eq!(app.cursor(), (0, 1, 0), "the byte step crosses tracks");
+        app.apply(Action::MoveLeft);
+        assert_eq!(app.cursor(), (0, 0, 4));
+
+        app.apply(Action::BrushWider);
+        assert_eq!(app.brush_width(), BrushWidth::Six);
+        app.nibble = 0;
+        app.track = 0;
+        app.apply(Action::MoveRight);
+        assert_eq!(app.cursor(), (0, 1, 0), "the cell step crosses tracks");
+
+        app.apply(Action::BrushTaller);
+        assert_eq!(app.brush_height(), BrushHeight::Lpb);
+        app.row = 0;
+        app.apply(Action::MoveDown);
+        assert_eq!(app.cursor().0, 4, "the LPB step is four rows");
+        app.apply(Action::MoveDown);
+        assert_eq!(app.cursor().0, 8);
+        app.apply(Action::MoveUp);
+        assert_eq!(app.cursor().0, 4);
     }
 
     #[test]
@@ -5944,8 +6149,8 @@ mod tests {
         app.apply(Action::BrushWider);
         app.apply(Action::BrushWider);
         app.apply(Action::SelectRight);
-        // The brush shifts its origin back to stay inside the pattern, the
-        // selection starts at the anchor, and the cursor follows the head.
+        // The brush and the cell-wide selection both cover the anchor's
+        // whole cell; the cursor follows the head.
         let selection = app.selection().expect("selection");
         assert_eq!(selection.anchor, (0, 8));
         assert_eq!(app.cursor(), (0, 1, 5), "the cursor follows the head");
@@ -5963,9 +6168,72 @@ mod tests {
             Rect {
                 top: 0,
                 bottom: 0,
-                left: 8,
+                left: 6,
                 right: 11
             }
+        );
+    }
+
+    #[test]
+    fn cell_brush_selection_extends_whole_cells_in_both_directions() {
+        // Anchor in track 1, second nibble of its cell.
+        let mut app = app_with(8, 4);
+        app.track = 1;
+        app.nibble = 2;
+        app.apply(Action::BrushWider);
+        app.apply(Action::BrushWider);
+        assert_eq!(app.brush_width(), BrushWidth::Six);
+
+        app.apply(Action::SelectLeft);
+        assert_eq!(
+            (bounds(&app).left, bounds(&app).right),
+            (6, 11),
+            "the first Shift+Left selects the whole anchor cell"
+        );
+        app.apply(Action::SelectLeft);
+        assert_eq!(
+            (bounds(&app).left, bounds(&app).right),
+            (0, 11),
+            "the next Shift+Left extends by one whole cell, not a byte"
+        );
+        app.apply(Action::SelectLeft);
+        assert_eq!((bounds(&app).left, bounds(&app).right), (0, 11));
+
+        let mut app = app_with(8, 4);
+        app.track = 1;
+        app.nibble = 2;
+        app.apply(Action::BrushWider);
+        app.apply(Action::BrushWider);
+        app.apply(Action::SelectRight);
+        assert_eq!((bounds(&app).left, bounds(&app).right), (6, 11));
+        app.apply(Action::SelectRight);
+        assert_eq!(
+            (bounds(&app).left, bounds(&app).right),
+            (6, 17),
+            "Shift+Right extends by one whole cell"
+        );
+        app.apply(Action::SelectLeft);
+        assert_eq!(
+            (bounds(&app).left, bounds(&app).right),
+            (6, 11),
+            "reversing shrinks by a whole cell, not a byte"
+        );
+
+        // The same applies to the offset-inclusive cell stage.
+        let mut app = app_with(8, 4);
+        app.apply(Action::ToggleOffsets);
+        app.track = 1;
+        app.nibble = 2;
+        app.apply(Action::BrushWider);
+        app.apply(Action::BrushWider);
+        assert_eq!(app.brush_width(), BrushWidth::Ten);
+        app.apply(Action::SelectLeft);
+        assert_eq!((bounds(&app).left, bounds(&app).right), (10, 19));
+        app.apply(Action::SelectLeft);
+        assert_eq!(
+            (bounds(&app).left, bounds(&app).right),
+            (0, 19),
+            "Shift+Left with offsets visible extends whole offset cells"
         );
     }
 
