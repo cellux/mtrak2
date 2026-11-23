@@ -21,6 +21,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use crate::app::{App, Mode, Screen};
+use crate::browser::{Browser, Entry};
 use crate::chooser::ChooserKind;
 use crate::code::{highlight, TokenKind};
 use crate::key::{Code, Key};
@@ -163,6 +164,7 @@ fn draw(frame: &mut Frame, app: &App) {
     draw_header(frame, app, chunks[0]);
     match app.screen() {
         Screen::Help => draw_help(frame, chunks[1]),
+        Screen::Browser => draw_browser(frame, app, chunks[1]),
         Screen::Pattern => draw_pattern(frame, app, chunks[1]),
         Screen::Code => draw_code(frame, app, chunks[1]),
     }
@@ -204,6 +206,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Area) {
     };
     let screen = match app.screen() {
         Screen::Help => "HELP".to_string(),
+        Screen::Browser => "FILES".to_string(),
         Screen::Pattern => format!(
             "PAT {:02X}  LPB {}",
             app.current_pattern().value(),
@@ -235,8 +238,10 @@ fn draw_help(frame: &mut Frame, area: Area) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let text = vec![
-        Line::raw("F1 help   F2 pattern   F3 code"),
+        Line::raw("F1 help   F2 files   F3 pattern   F4 code"),
         Line::raw(""),
+        Line::raw("Files:   arrows move  enter open  left/right directory"),
+        Line::raw("         type to filter  bksp/alt-bksp edit  esc clears"),
         Line::raw("Pattern: arrows move  hex types  enter edits  alt-enter choose"),
         Line::raw("         ctrl-p play  ctrl-r record  ctrl-e edit"),
         Line::raw("         space play  S start row  o offsets  : command"),
@@ -249,6 +254,92 @@ fn draw_help(frame: &mut Frame, area: Area) {
         Line::raw("         ctrl-a/e home/end  ctrl-k/u kill  alt-bksp word"),
     ];
     frame.render_widget(Paragraph::new(text), inner);
+}
+
+fn draw_browser(frame: &mut Frame, app: &App, area: Area) {
+    let block = Block::default().borders(Borders::ALL).title(" files ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let Some(browser) = app.browser() else {
+        return;
+    };
+    if inner.width < 2 || inner.height < 1 {
+        return;
+    }
+    let path: String = browser
+        .directory()
+        .display()
+        .to_string()
+        .chars()
+        .take(inner.width as usize)
+        .collect();
+    let mut lines = vec![Line::from(Span::styled(
+        path,
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    let rows = inner.height.saturating_sub(1) as usize;
+    if rows == 0 {
+        frame.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+    let visible = browser.visible_entries();
+    let selected = visible
+        .iter()
+        .position(|entry| browser.is_selected(&entry.name));
+    let offset = selected.map_or(0, |index| scroll_offset(index, visible.len(), rows));
+    for entry in visible.iter().skip(offset).take(rows) {
+        let line = Line::from(browser_entry_spans(
+            browser,
+            entry,
+            browser.is_selected(&entry.name),
+        ));
+        lines.push(line);
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn browser_entry_spans(browser: &Browser, entry: &Entry, selected: bool) -> Vec<Span<'static>> {
+    let base = if selected {
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Blue)
+            .add_modifier(Modifier::BOLD)
+    } else if entry.is_dir() {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+    let highlight = base.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let chars: Vec<char> = entry.name.chars().collect();
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    for (start, end) in browser.highlights(&entry.name) {
+        if start > cursor {
+            spans.push(Span::styled(
+                chars[cursor..start].iter().collect::<String>(),
+                base,
+            ));
+        }
+        spans.push(Span::styled(
+            chars[start..end.min(chars.len())]
+                .iter()
+                .collect::<String>(),
+            highlight,
+        ));
+        cursor = end;
+    }
+    if cursor < chars.len() {
+        spans.push(Span::styled(
+            chars[cursor..].iter().collect::<String>(),
+            base,
+        ));
+    }
+    if entry.is_dir() {
+        spans.push(Span::styled("/", base));
+    }
+    spans
 }
 
 fn draw_pattern(frame: &mut Frame, app: &App, area: Area) {
@@ -654,7 +745,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Area) {
         )),
         None => {
             let hint = match app.screen() {
-                Screen::Help => "F2 pattern  F3 code  ctrl-q quit",
+                Screen::Help => "F2 files  F3 pattern  F4 code  ctrl-q quit",
+                Screen::Browser => {
+                    "arrows move  enter open  left/right dir  type filter  : command  esc clear"
+                }
                 Screen::Pattern => {
                     "space play  S start  F7/F8 trsp  ctrl-p/r/e  : command  esc stop"
                 }
@@ -787,8 +881,24 @@ fn viewport_scroll(current: usize, cursor: usize, total: usize, visible: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{cwd_guard, cwd_lock};
     use mtrak_core::composition::{Composition, PatternId};
     use ratatui::backend::TestBackend;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mtrak-ui-browser-{}-{}-{}",
+            std::process::id(),
+            DIR_COUNTER.fetch_add(1, Ordering::SeqCst),
+            name
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     fn app_with(rows: usize, tracks: usize) -> App {
         let mut project = mtrak_midi_io::TrackerProject::new(Composition::new());
@@ -1066,9 +1176,132 @@ mod tests {
     }
 
     #[test]
+    fn browser_renders_the_path_entries_and_selection() {
+        let _lock = cwd_lock();
+        let _guard = cwd_guard();
+        let dir = temp_dir("render");
+        std::fs::create_dir(dir.join("samples")).unwrap();
+        std::fs::write(dir.join("song.mid"), b"").unwrap();
+        std::fs::write(dir.join(".hidden.mid"), b"").unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let shown = std::fs::canonicalize(&dir).unwrap();
+        let shown = shown.to_string_lossy().into_owned();
+
+        let mut app = app_with(4, 1);
+        app.handle_key(Key::new(Code::Function(2)));
+        assert_eq!(app.screen(), Screen::Browser);
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rows = screen_rows(terminal.backend().buffer());
+        assert!(rows[0].contains("FILES"), "header: {rows:#?}");
+        assert!(
+            rows.iter().any(|line| line.contains(&shown)),
+            "path: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|line| line.contains("samples/")),
+            "dir indicator: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|line| line.contains(".hidden.mid")),
+            "hidden entry: {rows:#?}"
+        );
+        assert!(rows.iter().any(|line| line.contains("song.mid")));
+
+        let selected = rows
+            .iter()
+            .position(|line| line.contains("samples/"))
+            .unwrap();
+        let x = rows[selected].find("samples/").unwrap() as u16;
+        assert_eq!(
+            terminal.backend().buffer()[(x, selected as u16)].bg,
+            Color::Blue,
+            "the first entry is selected"
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_highlights_every_filter_match() {
+        let _lock = cwd_lock();
+        let _guard = cwd_guard();
+        let dir = temp_dir("highlight");
+        std::fs::write(dir.join("alpha.mid"), b"").unwrap();
+        std::fs::write(dir.join("beta.mid"), b"").unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        let mut app = app_with(4, 1);
+        app.handle_key(Key::new(Code::Function(2)));
+        for ch in "mid".chars() {
+            app.handle_key(Key::ch(ch));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = screen_rows(buffer);
+        let beta = rows
+            .iter()
+            .position(|line| line.contains("beta.mid"))
+            .expect("beta stays visible");
+        let x = rows[beta].find("mid").unwrap() as u16;
+        assert_eq!(
+            buffer[(x, beta as u16)].fg,
+            Color::Yellow,
+            "the match is highlighted"
+        );
+        let alpha = rows
+            .iter()
+            .position(|line| line.contains("alpha.mid"))
+            .unwrap();
+        assert_eq!(
+            buffer[(1, alpha as u16)].bg,
+            Color::Blue,
+            "the first match is selected"
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_rendering_handles_narrow_empty_long_and_scrolled_fixtures() {
+        let _lock = cwd_lock();
+        let _guard = cwd_guard();
+        let dir = temp_dir("edge");
+        std::env::set_current_dir(&dir).unwrap();
+
+        {
+            let mut app = app_with(4, 1);
+            app.handle_key(Key::new(Code::Function(2)));
+            let mut terminal = Terminal::new(TestBackend::new(8, 3)).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            assert!(app.browser().unwrap().visible_entries().is_empty());
+        }
+
+        let long = "z".repeat(200);
+        std::fs::write(dir.join(&long), b"").unwrap();
+        for index in 0..40 {
+            std::fs::write(dir.join(format!("file-{index:02}.mid")), b"").unwrap();
+        }
+        let mut app = app_with(4, 1);
+        app.handle_key(Key::new(Code::Function(2)));
+        app.handle_key(Key::new(Code::End));
+        assert_eq!(app.browser().unwrap().selected(), Some(long.as_str()));
+        let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rows = screen_rows(terminal.backend().buffer());
+        assert!(
+            rows.iter().any(|line| line.contains("zzzz")),
+            "the selection scrolls into view: {rows:#?}"
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn code_cursor_is_visible_on_empty_lines_without_highlighting_the_line() {
         let mut app = app_with(4, 2);
-        app.handle_key(Key::new(Code::Function(3)));
+        app.handle_key(Key::new(Code::Function(4)));
         assert_eq!(app.screen(), Screen::Code);
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
         let render = |terminal: &mut Terminal<TestBackend>, app: &App| {

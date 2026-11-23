@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod browser;
 pub mod chooser;
 pub mod clipboard;
 pub mod code;
@@ -19,9 +20,13 @@ pub mod path;
 pub mod ui;
 pub mod undo;
 
+#[cfg(test)]
+mod test_support;
+
 pub use app::{
     App, BrushHeight, BrushWidth, ChooserClipboard, LuaCommand, MacroSource, Message, Mode, Rect,
     Screen, Selection,
 };
+pub use browser::{Browser, Entry, EntryKind};
 pub use command::{parse as parse_command, Command};
 pub use key::{Action, Code, Key};

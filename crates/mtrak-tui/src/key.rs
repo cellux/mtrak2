@@ -174,6 +174,8 @@ pub enum Action {
     ToggleOffsets,
     /// Switch to the Help screen.
     HelpScreen,
+    /// Switch to the file browser.
+    FileBrowserScreen,
     /// Switch to the Pattern screen.
     PatternScreen,
     /// Switch to the Code screen.
@@ -280,8 +282,9 @@ pub fn lookup(key: Key) -> Option<Action> {
         // deliberately keeps the plain-Enter behavior.
         (Enter, _, _) => A::OpenEventEditor,
         (Function(1), false, _) => A::HelpScreen,
-        (Function(2), false, _) => A::PatternScreen,
-        (Function(3), false, _) => A::CodeScreen,
+        (Function(2), false, _) => A::FileBrowserScreen,
+        (Function(3), false, _) => A::PatternScreen,
+        (Function(4), false, _) => A::CodeScreen,
         (Function(5), false, _) => A::ReloadLua,
         (Function(7), false, _) => A::TransposeDown,
         (Function(8), false, _) => A::TransposeUp,
@@ -355,6 +358,22 @@ mod tests {
             "Ctrl-Enter is not a supported binding"
         );
         assert_eq!(lookup(Key::alt(Code::Enter)), Some(Action::OpenChooser));
+        assert_eq!(
+            lookup(Key::new(Code::Function(1))),
+            Some(Action::HelpScreen)
+        );
+        assert_eq!(
+            lookup(Key::new(Code::Function(2))),
+            Some(Action::FileBrowserScreen)
+        );
+        assert_eq!(
+            lookup(Key::new(Code::Function(3))),
+            Some(Action::PatternScreen)
+        );
+        assert_eq!(
+            lookup(Key::new(Code::Function(4))),
+            Some(Action::CodeScreen)
+        );
     }
 
     #[test]

@@ -43,7 +43,9 @@ fn build_app(path: Option<String>) -> Result<App, String> {
         Some(path) => {
             let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
             let loaded = mtrak_midi_io::smf::load(&bytes).map_err(|e| e.to_string())?;
-            (loaded.project, Some(std::path::PathBuf::from(path)))
+            let canonical =
+                std::fs::canonicalize(&path).map_err(|e| format!("cannot resolve {path}: {e}"))?;
+            (loaded.project, Some(canonical))
         }
         None => (
             mtrak_midi_io::TrackerProject::new(mtrak_core::composition::Composition::new()),
@@ -53,6 +55,10 @@ fn build_app(path: Option<String>) -> Result<App, String> {
 
     let mut app = App::new(project);
     if let Some(path) = path {
+        if let Some(parent) = path.parent() {
+            std::env::set_current_dir(parent)
+                .map_err(|e| format!("cannot change directory to {}: {e}", parent.display()))?;
+        }
         app.set_path(path);
     }
 

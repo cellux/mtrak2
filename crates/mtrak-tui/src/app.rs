@@ -15,6 +15,7 @@ use mtrak_engine::macros::MacroFactory;
 use mtrak_engine::scheduler::TimedEvent;
 use mtrak_midi::{MidiBackend, MidiError, OutputManager, PortInfo};
 
+use crate::browser::Browser;
 use crate::chooser::{Chooser, ChooserKind};
 use crate::clipboard::{destination_edit, NibbleClipboard};
 use crate::code::CodeEditor;
@@ -29,9 +30,11 @@ use crate::undo::UndoStack;
 pub enum Screen {
     /// `F1` — the help placeholder.
     Help,
-    /// `F2` — the pattern grid.
+    /// `F2` — the filesystem browser.
+    Browser,
+    /// `F3` — the pattern grid.
     Pattern,
-    /// `F3` — the Lua code editor.
+    /// `F4` — the Lua code editor.
     Code,
 }
 
@@ -355,6 +358,9 @@ pub struct App {
     chooser: Option<Chooser>,
     chooser_clipboard: Option<ChooserClipboard>,
 
+    // File browser (created lazily on the first F2).
+    browser: Option<Browser>,
+
     // External services.
     midi: Option<OutputManager<Box<dyn MidiBackend>>>,
     macro_source: Option<Box<dyn MacroSource>>,
@@ -419,6 +425,7 @@ impl App {
             code_struct_undo: UndoStack::new(64),
             chooser: None,
             chooser_clipboard: None,
+            browser: None,
             midi: None,
             macro_source: None,
             lua_commands: Vec::new(),
@@ -558,6 +565,11 @@ impl App {
     /// The current file path, if any.
     pub fn path(&self) -> Option<&std::path::Path> {
         self.path.as_deref()
+    }
+
+    /// The filesystem browser, once the F2 workspace has been opened.
+    pub fn browser(&self) -> Option<&Browser> {
+        self.browser.as_ref()
     }
 
     /// The composition-global settings.
@@ -879,6 +891,7 @@ impl App {
         // Workspace-independent actions.
         match action {
             Action::HelpScreen => return self.switch_screen(Screen::Help),
+            Action::FileBrowserScreen => return self.switch_screen(Screen::Browser),
             Action::PatternScreen => return self.switch_screen(Screen::Pattern),
             Action::CodeScreen => return self.switch_screen(Screen::Code),
             Action::OpenChooser => return self.open_chooser(),
@@ -1096,6 +1109,7 @@ impl App {
                 }
             }
             Action::HelpScreen
+            | Action::FileBrowserScreen
             | Action::PatternScreen
             | Action::CodeScreen
             | Action::OpenChooser
@@ -1979,7 +1993,7 @@ impl App {
         match self.screen {
             Screen::Pattern => self.undo_pattern(),
             Screen::Code => self.undo_module(),
-            Screen::Help => {}
+            Screen::Browser | Screen::Help => {}
         }
     }
 
@@ -1987,7 +2001,7 @@ impl App {
         match self.screen {
             Screen::Pattern => self.redo_pattern(),
             Screen::Code => self.redo_module(),
-            Screen::Help => {}
+            Screen::Browser | Screen::Help => {}
         }
     }
 
@@ -2496,7 +2510,72 @@ impl App {
         if self.screen == Screen::Code {
             self.sync_module_text();
         }
+        if screen == Screen::Browser {
+            self.ensure_browser();
+        }
         self.screen = screen;
+    }
+
+    /// Creates the browser on first use, anchored at the loaded file's parent
+    /// or the process current directory, and keeps the process cwd on the
+    /// displayed directory whenever the workspace is entered.
+    fn ensure_browser(&mut self) {
+        if let Some(browser) = self.browser.as_ref() {
+            let dir = browser.directory().to_path_buf();
+            if let Err(error) = std::env::set_current_dir(&dir) {
+                self.set_message(
+                    format!("cannot change directory to {}: {error}", dir.display()),
+                    true,
+                );
+            }
+            return;
+        }
+        let loaded_name = self
+            .path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned());
+        let dir = match self.path.as_ref() {
+            Some(path) => {
+                let canonical = std::fs::canonicalize(path).ok();
+                match canonical.as_deref().and_then(std::path::Path::parent) {
+                    Some(parent) => parent.to_path_buf(),
+                    None => match path.parent() {
+                        Some(parent) => parent.to_path_buf(),
+                        None => match std::env::current_dir() {
+                            Ok(dir) => dir,
+                            Err(error) => {
+                                self.set_message(
+                                    format!("cannot determine the current directory: {error}"),
+                                    true,
+                                );
+                                return;
+                            }
+                        },
+                    },
+                }
+            }
+            None => match std::env::current_dir() {
+                Ok(dir) => dir,
+                Err(error) => {
+                    self.set_message(
+                        format!("cannot determine the current directory: {error}"),
+                        true,
+                    );
+                    return;
+                }
+            },
+        };
+        match Browser::open(dir) {
+            Ok(mut browser) => {
+                match loaded_name {
+                    Some(name) => browser.select_name(&name),
+                    None => browser.select_first_visible(),
+                }
+                self.browser = Some(browser);
+            }
+            Err(error) => self.set_message(error, true),
+        }
     }
 
     // --- Chooser --------------------------------------------------------------
@@ -2505,7 +2584,7 @@ impl App {
         let kind = match self.screen {
             Screen::Pattern => ChooserKind::Pattern,
             Screen::Code => ChooserKind::Code,
-            Screen::Help => return,
+            Screen::Browser | Screen::Help => return,
         };
         if self.screen == Screen::Help {
             return;
@@ -2846,7 +2925,8 @@ impl App {
 
     /// Saves the project as a tracker file.
     pub fn save(&mut self, path: Option<String>) -> Result<(), String> {
-        let path = self.resolve_path(path)?;
+        let requested = self.resolve_path(path)?;
+        let path = self.canonical_output_path(&requested)?;
         self.ensure_lua()?;
         let factory = self.macro_source.as_ref().and_then(|s| s.factory());
         let bytes =
@@ -2856,6 +2936,30 @@ impl App {
         self.dirty = false;
         self.set_message(format!("wrote {}", path.display()), false);
         Ok(())
+    }
+
+    /// Resolves an output path to a canonical absolute path, canonicalizing
+    /// its existing parent when the file does not exist yet.
+    fn canonical_output_path(&self, path: &std::path::Path) -> Result<PathBuf, String> {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|e| format!("cannot determine the current directory: {e}"))?
+                .join(path)
+        };
+        if let Ok(canonical) = std::fs::canonicalize(&absolute) {
+            return Ok(canonical);
+        }
+        let file_name = absolute
+            .file_name()
+            .ok_or_else(|| format!("invalid output path: {}", absolute.display()))?;
+        let parent = absolute
+            .parent()
+            .ok_or_else(|| format!("invalid output path: {}", absolute.display()))?;
+        let parent = std::fs::canonicalize(parent)
+            .map_err(|e| format!("cannot access output directory {}: {e}", parent.display()))?;
+        Ok(parent.join(file_name))
     }
 
     /// Exports standard MIDI.
@@ -2875,6 +2979,13 @@ impl App {
         let path = self.resolve_path(path)?;
         let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
         let loaded = mtrak_midi_io::smf::load(&bytes).map_err(|e| e.to_string())?;
+        let path = std::fs::canonicalize(&path)
+            .map_err(|e| format!("cannot resolve {}: {e}", path.display()))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("cannot find the parent of {}", path.display()))?;
+        std::env::set_current_dir(parent)
+            .map_err(|e| format!("cannot change directory to {}: {e}", parent.display()))?;
         self.project = loaded.project;
         self.project.ensure_setup_module();
         self.current = self.project.composition.selected_main();
@@ -2894,6 +3005,7 @@ impl App {
         self.lua_dirty = true;
         self.lua_commands.clear();
         self.edit = None;
+        self.screen = Screen::Pattern;
         let _ = self.ensure_lua();
         self.set_message(
             format!(
@@ -3106,9 +3218,12 @@ impl App {
             return self.switch_screen(Screen::Help);
         }
         if let Code::Function(2) = key.code {
-            return self.switch_screen(Screen::Pattern);
+            return self.switch_screen(Screen::Browser);
         }
         if let Code::Function(3) = key.code {
+            return self.switch_screen(Screen::Pattern);
+        }
+        if let Code::Function(4) = key.code {
             return self.switch_screen(Screen::Code);
         }
         // Quitting is global to every workspace.
@@ -3116,9 +3231,139 @@ impl App {
             return self.apply(Action::Quit);
         }
         match self.screen {
+            Screen::Browser => self.handle_browser_key(key),
             Screen::Code => self.handle_code_key(key),
             Screen::Pattern => self.handle_pattern_key(key),
             Screen::Help => {}
+        }
+    }
+
+    fn handle_browser_key(&mut self, key: Key) {
+        let plain = !key.ctrl && !key.alt && !key.shift;
+        match key.code {
+            Code::Esc if plain => {
+                if let Some(browser) = self.browser.as_mut() {
+                    if browser.filter_is_empty() {
+                        return;
+                    }
+                    browser.clear_filter();
+                }
+                return;
+            }
+            Code::Left if plain => return self.browser_go_parent(),
+            Code::Right if plain => return self.browser_enter_dir(),
+            Code::Enter if !key.ctrl && !key.alt => return self.browser_open_selected(),
+            Code::Up if plain => {
+                if let Some(browser) = self.browser.as_mut() {
+                    browser.move_selection(-1);
+                }
+                return;
+            }
+            Code::Down if plain => {
+                if let Some(browser) = self.browser.as_mut() {
+                    browser.move_selection(1);
+                }
+                return;
+            }
+            Code::PageUp if plain => {
+                if let Some(browser) = self.browser.as_mut() {
+                    browser.move_selection(-10);
+                }
+                return;
+            }
+            Code::PageDown if plain => {
+                if let Some(browser) = self.browser.as_mut() {
+                    browser.move_selection(10);
+                }
+                return;
+            }
+            Code::Home if plain => {
+                if let Some(browser) = self.browser.as_mut() {
+                    browser.select_first_visible();
+                }
+                return;
+            }
+            Code::End if plain => {
+                if let Some(browser) = self.browser.as_mut() {
+                    browser.move_selection(isize::MAX);
+                }
+                return;
+            }
+            Code::Backspace if key.alt => {
+                if let Some(browser) = self.browser.as_mut() {
+                    browser.kill_word_filter();
+                }
+                return;
+            }
+            Code::Char('h') if key.ctrl && key.alt => {
+                if let Some(browser) = self.browser.as_mut() {
+                    browser.kill_word_filter();
+                }
+                return;
+            }
+            Code::Backspace if !key.ctrl => {
+                if let Some(browser) = self.browser.as_mut() {
+                    browser.backspace_filter();
+                }
+                return;
+            }
+            Code::Char(':') if plain => {
+                if self.browser.as_ref().is_some_and(Browser::filter_is_empty) {
+                    return self.enter_command_mode();
+                }
+                if let Some(browser) = self.browser.as_mut() {
+                    browser.push_filter(':');
+                }
+                return;
+            }
+            Code::Char(c) if !key.ctrl && !key.alt => {
+                if let Some(browser) = self.browser.as_mut() {
+                    browser.push_filter(c);
+                }
+                return;
+            }
+            _ => {}
+        }
+        if let Some(action) = key::lookup(key) {
+            self.apply(action);
+        }
+    }
+
+    fn browser_enter_dir(&mut self) {
+        let result = match self.browser.as_mut() {
+            Some(browser) => browser.enter_selected_dir(),
+            None => return,
+        };
+        if let Err(error) = result {
+            self.set_message(error, true);
+        }
+    }
+
+    fn browser_go_parent(&mut self) {
+        let result = match self.browser.as_mut() {
+            Some(browser) => browser.go_parent(),
+            None => return,
+        };
+        if let Err(error) = result {
+            self.set_message(error, true);
+        }
+    }
+
+    fn browser_open_selected(&mut self) {
+        let is_dir = self
+            .browser
+            .as_ref()
+            .and_then(Browser::selected_entry)
+            .is_some_and(|entry| entry.is_dir());
+        if is_dir {
+            return self.browser_enter_dir();
+        }
+        let Some(path) = self.browser.as_ref().and_then(Browser::selected_midi) else {
+            return;
+        };
+        let path = path.to_string_lossy().into_owned();
+        if let Err(error) = self.load(Some(path)) {
+            self.set_message(error, true);
         }
     }
 
@@ -3580,8 +3825,32 @@ fn chromatic_map() -> Vec<(char, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{cwd_guard, cwd_lock};
     use mtrak_core::event::{MacroCall, MetaEvent};
     use mtrak_midi::MockBackend;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mtrak-app-browser-{}-{}-{}",
+            std::process::id(),
+            DIR_COUNTER.fetch_add(1, Ordering::SeqCst),
+            name
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_project_file(dir: &std::path::Path, name: &str) -> PathBuf {
+        let project = mtrak_midi_io::TrackerProject::new(Composition::new());
+        let bytes = mtrak_midi_io::smf::save_project(&project, None).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
 
     fn app_with(rows: usize, tracks: usize) -> App {
         let mut project = mtrak_midi_io::TrackerProject::new(Composition::new());
@@ -3944,11 +4213,11 @@ mod tests {
     fn screens_switch_with_function_keys() {
         let mut app = app_with(4, 2);
         assert_eq!(app.screen(), Screen::Pattern);
-        app.handle_key(Key::new(Code::Function(3)));
+        app.handle_key(Key::new(Code::Function(4)));
         assert_eq!(app.screen(), Screen::Code);
         app.handle_key(Key::new(Code::Function(1)));
         assert_eq!(app.screen(), Screen::Help);
-        app.handle_key(Key::new(Code::Function(2)));
+        app.handle_key(Key::new(Code::Function(3)));
         assert_eq!(app.screen(), Screen::Pattern);
     }
 
@@ -4304,7 +4573,7 @@ mod tests {
 
     #[test]
     fn ctrl_q_quits_from_every_screen() {
-        for function in [1u8, 2, 3] {
+        for function in [1u8, 2, 3, 4] {
             let mut app = app_with(4, 2);
             app.handle_key(Key::new(Code::Function(function)));
             app.handle_key(Key::ctrl(Code::Char('q')));
@@ -4336,7 +4605,7 @@ mod tests {
     #[test]
     fn ctrl_s_saves_without_typing_on_the_code_screen() {
         let mut app = app_with(4, 2);
-        app.handle_key(Key::new(Code::Function(3)));
+        app.handle_key(Key::new(Code::Function(4)));
         let line = app.code_editor().line(0).to_vec();
         app.handle_key(Key::ctrl(Code::Char('s')));
         assert_eq!(app.code_editor().line(0), &line[..], "no 's' is typed");
@@ -4351,7 +4620,7 @@ mod tests {
         app.handle_key(Key::new(Code::Esc));
 
         // On the Code screen Alt-Enter must not fall through to a newline.
-        app.handle_key(Key::new(Code::Function(3)));
+        app.handle_key(Key::new(Code::Function(4)));
         let lines = app.code_editor().line_count();
         app.handle_key(Key::alt(Code::Enter));
         assert_eq!(app.mode(), Mode::Chooser);
@@ -4424,7 +4693,7 @@ mod tests {
     #[test]
     fn code_screen_creates_lazy_user_modules_and_edits_them() {
         let mut app = app_with(4, 2);
-        app.handle_key(Key::new(Code::Function(3)));
+        app.handle_key(Key::new(Code::Function(4)));
         app.apply(Action::OpenChooser);
         for c in "40".chars() {
             app.handle_key(Key::ch(c));
@@ -4441,7 +4710,7 @@ mod tests {
     #[test]
     fn builtin_modules_are_read_only() {
         let mut app = app_with(4, 2);
-        app.handle_key(Key::new(Code::Function(3)));
+        app.handle_key(Key::new(Code::Function(4)));
         app.select_module(1);
         assert!(app.module_readonly(1));
         let before = app.project().modules.get(&1).cloned();
@@ -5257,7 +5526,7 @@ mod tests {
 
         // It is a panic button: it also works away from the pattern screen.
         sent.borrow_mut().clear();
-        app.handle_key(Key::new(Code::Function(3)));
+        app.handle_key(Key::new(Code::Function(4)));
         app.handle_key(Key::alt(Code::Char('.')));
         assert_eq!(sent.borrow().len(), 16);
     }
@@ -5422,7 +5691,7 @@ mod tests {
     #[test]
     fn chooser_module_copy_paste_is_type_specific() {
         let mut app = app_with(4, 2);
-        app.handle_key(Key::new(Code::Function(3)));
+        app.handle_key(Key::new(Code::Function(4)));
         app.select_module(0x40);
         app.handle_key(Key::ch('X'));
         app.apply(Action::OpenChooser);
@@ -5450,7 +5719,7 @@ mod tests {
     #[test]
     fn per_module_undo_histories_are_isolated() {
         let mut app = app_with(4, 2);
-        app.handle_key(Key::new(Code::Function(3)));
+        app.handle_key(Key::new(Code::Function(4)));
         app.select_module(0x40);
         app.handle_key(Key::ch('A'));
         app.select_module(0x41);
@@ -6347,28 +6616,273 @@ mod tests {
     }
 
     #[test]
-    fn partial_operations_export_canonically() {
+    fn f2_initializes_the_browser_once_and_preserves_its_state() {
+        let _lock = cwd_lock();
+        let _guard = cwd_guard();
+        let dir = temp_dir("init");
+        let song = write_project_file(&dir, "song.mid");
+        let canonical_dir = std::fs::canonicalize(&dir).unwrap();
+        let canonical_song = std::fs::canonicalize(&song).unwrap();
+
         let mut app = app_with(4, 2);
-        app.project
-            .composition
-            .pattern_mut(PatternId(0))
-            .unwrap()
-            .set_event(0, 0, note(60, 100));
-        app.nibble = 2;
-        app.apply(Action::ClearBlock);
-        let bytes = mtrak_midi_io::smf::export_standard(&app.project.composition, None).unwrap();
-        let loaded = mtrak_midi_io::smf::load(&bytes).unwrap();
+        app.set_path(canonical_song.clone());
+        app.handle_key(Key::new(Code::Function(2)));
+        assert_eq!(app.screen(), Screen::Browser);
+        let browser = app.browser().unwrap();
+        assert_eq!(browser.directory(), canonical_dir);
+        assert_eq!(browser.selected(), Some("song.mid"));
+        assert_eq!(std::env::current_dir().unwrap(), canonical_dir);
+
+        for ch in "song".chars() {
+            app.handle_key(Key::ch(ch));
+        }
+        assert_eq!(app.browser().unwrap().filter(), "song");
+        assert_eq!(app.browser().unwrap().selected(), Some("song.mid"));
+
+        app.handle_key(Key::new(Code::Function(3)));
+        assert_eq!(app.screen(), Screen::Pattern);
+        app.handle_key(Key::new(Code::Function(2)));
+        let browser = app.browser().unwrap();
+        assert_eq!(browser.directory(), canonical_dir);
+        assert_eq!(browser.filter(), "song");
+        assert_eq!(browser.selected(), Some("song.mid"));
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_enter_opens_midi_switches_to_pattern_and_updates_path_and_cwd() {
+        let _lock = cwd_lock();
+        let _guard = cwd_guard();
+        let dir = temp_dir("open-midi");
+        let song = write_project_file(&dir, "song.mid");
+        let canonical_dir = std::fs::canonicalize(&dir).unwrap();
+        let canonical_song = std::fs::canonicalize(&song).unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        let mut app = app_with(4, 2);
+        app.handle_key(Key::new(Code::Function(2)));
+        assert_eq!(app.browser().unwrap().selected(), Some("song.mid"));
+        app.handle_key(Key::new(Code::Enter));
+        assert_eq!(app.screen(), Screen::Pattern);
+        assert_eq!(app.path(), Some(canonical_song.as_path()));
+        assert_eq!(std::env::current_dir().unwrap(), canonical_dir);
+        assert!(app.message().is_some_and(|message| !message.is_error));
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_enter_ignores_non_midi_and_reports_malformed_midi() {
+        let _lock = cwd_lock();
+        let _guard = cwd_guard();
+        let dir = temp_dir("non-midi");
+        std::fs::write(dir.join("notes.txt"), b"not midi").unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        let mut app = app_with(4, 2);
+        app.handle_key(Key::new(Code::Function(2)));
+        assert_eq!(app.browser().unwrap().selected(), Some("notes.txt"));
+        app.handle_key(Key::new(Code::Enter));
+        assert_eq!(app.screen(), Screen::Browser);
+        assert!(app.path().is_none());
+        assert_eq!(app.browser().unwrap().selected(), Some("notes.txt"));
+        app.handle_key(Key::new(Code::Right));
+        assert_eq!(app.screen(), Screen::Browser);
+        assert!(app.path().is_none());
+
+        std::fs::write(dir.join("broken.mid"), b"MThd").unwrap();
+        app.browser.as_mut().unwrap().refresh().unwrap();
+        app.handle_key(Key::new(Code::Home));
+        assert_eq!(app.browser().unwrap().selected(), Some("broken.mid"));
+        app.handle_key(Key::new(Code::Enter));
+        assert_eq!(app.screen(), Screen::Browser, "a load failure stays put");
+        assert!(app.path().is_none());
+        assert!(app.message().is_some_and(|message| message.is_error));
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_navigation_enters_and_returns_to_directories() {
+        let _lock = cwd_lock();
+        let _guard = cwd_guard();
+        let dir = temp_dir("navigation");
+        std::fs::create_dir(dir.join("alpha")).unwrap();
+        std::fs::write(dir.join("alpha").join("inner.mid"), b"").unwrap();
+        std::fs::create_dir(dir.join("beta")).unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let canonical_dir = std::fs::canonicalize(&dir).unwrap();
+
+        let mut app = app_with(4, 2);
+        app.handle_key(Key::new(Code::Function(2)));
+        assert_eq!(app.browser().unwrap().selected(), Some("alpha"));
+        app.handle_key(Key::new(Code::Right));
         assert_eq!(
-            loaded
-                .project
-                .composition
-                .pattern(PatternId(0))
-                .unwrap()
-                .slot(0, 0)
-                .unwrap()
-                .event,
-            note(0, 100),
-            "partial operations remain canonical through export/import"
+            app.browser().unwrap().directory(),
+            canonical_dir.join("alpha")
         );
+        assert_eq!(app.browser().unwrap().selected(), Some("inner.mid"));
+        app.handle_key(Key::new(Code::Left));
+        assert_eq!(app.browser().unwrap().directory(), canonical_dir);
+        assert_eq!(app.browser().unwrap().selected(), Some("alpha"));
+        app.handle_key(Key::new(Code::Down));
+        assert_eq!(app.browser().unwrap().selected(), Some("beta"));
+        app.handle_key(Key::new(Code::Enter));
+        assert_eq!(
+            app.browser().unwrap().directory(),
+            canonical_dir.join("beta")
+        );
+        app.handle_key(Key::new(Code::Left));
+        assert_eq!(app.browser().unwrap().selected(), Some("beta"));
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_filter_editing_and_command_mode_interaction() {
+        let _lock = cwd_lock();
+        let _guard = cwd_guard();
+        let dir = temp_dir("filter");
+        std::fs::write(dir.join("alpha song.mid"), b"").unwrap();
+        std::fs::write(dir.join("beta.mid"), b"").unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        let mut app = app_with(4, 2);
+        app.handle_key(Key::new(Code::Function(2)));
+        app.handle_key(Key::new(Code::Down));
+        assert_eq!(app.browser().unwrap().selected(), Some("beta.mid"));
+        app.handle_key(Key::new(Code::Up));
+        assert_eq!(app.browser().unwrap().selected(), Some("alpha song.mid"));
+
+        for ch in "alpha song".chars() {
+            app.handle_key(Key::ch(ch));
+        }
+        assert_eq!(app.browser().unwrap().filter(), "alpha song");
+        app.handle_key(Key::alt(Code::Backspace));
+        assert_eq!(app.browser().unwrap().filter(), "alpha ");
+        app.handle_key(Key::new(Code::Backspace));
+        assert_eq!(app.browser().unwrap().filter(), "alpha");
+
+        app.handle_key(Key::ch(':'));
+        assert_eq!(app.mode(), Mode::Edit, "a non-empty filter takes the colon");
+        assert_eq!(app.browser().unwrap().filter(), "alpha:");
+        app.handle_key(Key::new(Code::Backspace));
+        assert_eq!(app.browser().unwrap().filter(), "alpha");
+
+        app.handle_key(Key::new(Code::Esc));
+        assert_eq!(app.browser().unwrap().filter(), "");
+        assert_eq!(app.mode(), Mode::Edit);
+        assert_eq!(app.screen(), Screen::Browser);
+        app.handle_key(Key::ch(':'));
+        assert_eq!(app.mode(), Mode::Command);
+        app.handle_key(Key::new(Code::Esc));
+        assert_eq!(app.screen(), Screen::Browser);
+    }
+
+    #[test]
+    fn commands_from_the_browser_use_its_directory_and_return_there() {
+        let _lock = cwd_lock();
+        let _guard = cwd_guard();
+        let dir = temp_dir("commands");
+        std::fs::create_dir(dir.join("nested")).unwrap();
+        let song = write_project_file(&dir.join("nested"), "song.mid");
+        std::env::set_current_dir(&dir).unwrap();
+        let canonical_dir = std::fs::canonicalize(&dir).unwrap();
+        let canonical_song = std::fs::canonicalize(&song).unwrap();
+
+        let mut app = app_with(4, 2);
+        app.handle_key(Key::new(Code::Function(2)));
+        app.handle_key(Key::ch(':'));
+        assert_eq!(app.mode(), Mode::Command, "colon opens command mode");
+        for ch in "w written.mid".chars() {
+            app.handle_key(Key::ch(ch));
+        }
+        assert_eq!(app.input_text(), "w written.mid");
+        app.handle_key(Key::new(Code::Enter));
+        assert_eq!(app.mode(), Mode::Edit, "command mode closes");
+        assert_eq!(app.screen(), Screen::Browser);
+        let written = canonical_dir.join("written.mid");
+        assert!(
+            written.exists(),
+            "save failed: {:?} (path {:?})",
+            app.message(),
+            app.path()
+        );
+        assert_eq!(app.path(), Some(written.as_path()));
+        assert_eq!(std::env::current_dir().unwrap(), canonical_dir);
+
+        app.handle_key(Key::ch(':'));
+        for ch in "r nested/song.mid".chars() {
+            app.handle_key(Key::ch(ch));
+        }
+        app.handle_key(Key::new(Code::Enter));
+        assert_eq!(app.screen(), Screen::Pattern);
+        assert_eq!(app.path(), Some(canonical_song.as_path()));
+        assert_eq!(
+            std::env::current_dir().unwrap(),
+            canonical_dir.join("nested")
+        );
+
+        // Reopening F2 restores the browser's directory as the cwd even though
+        // :r loaded a file from elsewhere.
+        app.handle_key(Key::new(Code::Function(2)));
+        assert_eq!(app.browser().unwrap().directory(), canonical_dir);
+        assert_eq!(std::env::current_dir().unwrap(), canonical_dir);
+    }
+
+    #[test]
+    fn save_after_browsing_stores_canonical_paths_and_keeps_plain_writes_anchored() {
+        let _lock = cwd_lock();
+        let _guard = cwd_guard();
+        let dir = temp_dir("save");
+        fs_create(&dir.join("sub"));
+        std::env::set_current_dir(&dir).unwrap();
+        let canonical_dir = std::fs::canonicalize(&dir).unwrap();
+
+        let mut app = app_with(4, 2);
+        app.handle_key(Key::new(Code::Function(2)));
+        app.handle_key(Key::ch(':'));
+        for ch in "w first.mid".chars() {
+            app.handle_key(Key::ch(ch));
+        }
+        app.handle_key(Key::new(Code::Enter));
+        let first = canonical_dir.join("first.mid");
+        assert_eq!(
+            app.path(),
+            Some(first.as_path()),
+            "message: {:?}",
+            app.message()
+        );
+
+        app.handle_key(Key::ch(':'));
+        for ch in "w missing/fail.mid".chars() {
+            app.handle_key(Key::ch(ch));
+        }
+        app.handle_key(Key::new(Code::Enter));
+        assert_eq!(app.screen(), Screen::Browser);
+        assert!(app.message().is_some_and(|message| message.is_error));
+        assert_eq!(app.path(), Some(first.as_path()));
+        assert!(!canonical_dir.join("missing").exists());
+
+        app.handle_key(Key::new(Code::Esc));
+        assert_eq!(app.mode(), Mode::Edit);
+        app.handle_key(Key::new(Code::Down));
+        app.handle_key(Key::new(Code::Right));
+        assert_eq!(std::env::current_dir().unwrap(), canonical_dir.join("sub"));
+        app.handle_key(Key::ch(':'));
+        app.handle_key(Key::ch('w'));
+        app.handle_key(Key::new(Code::Enter));
+        assert_eq!(
+            app.path(),
+            Some(first.as_path()),
+            "plain :w uses the stored path"
+        );
+        assert!(first.exists());
+        assert!(!canonical_dir.join("sub").join("first.mid").exists());
+    }
+
+    fn fs_create(path: &std::path::Path) {
+        std::fs::create_dir_all(path).unwrap();
     }
 }
