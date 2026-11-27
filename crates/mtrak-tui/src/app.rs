@@ -2911,6 +2911,168 @@ impl App {
         }
     }
 
+    // --- REPL support --------------------------------------------------------
+
+    /// Mutable access to the project for REPL host operations.
+    pub fn repl_project_mut(&mut self) -> &mut mtrak_midi_io::TrackerProject {
+        &mut self.project
+    }
+
+    /// Clears every TUI undo stack. Called after a successful REPL mutation.
+    pub fn repl_clear_undo(&mut self) {
+        self.pattern_undo.clear();
+        self.pattern_struct_undo = UndoStack::new(64);
+        self.module_undo.clear();
+        self.code_struct_undo = UndoStack::new(64);
+    }
+
+    /// Marks the project dirty and bumps the revision after a REPL mutation.
+    pub fn repl_mark_mutated(&mut self) {
+        self.dirty = true;
+        self.project_revision = self.project_revision.wrapping_add(1);
+        self.repl_clear_undo();
+    }
+
+    /// Stops playback and releases all notes.
+    pub fn repl_stop_playback(&mut self) {
+        self.stop_playback_and_release();
+    }
+
+    /// Starts playback from a requested pattern and row without changing the
+    /// selected-main project metadata.
+    pub fn repl_play(&mut self, pattern: Option<u8>, row: Option<usize>) -> Result<(), String> {
+        let id = pattern
+            .map(PatternId)
+            .unwrap_or_else(|| self.project.composition.selected_main());
+        let row = row.unwrap_or(self.play_start_row);
+        let Some(pattern) = self.project.composition.pattern(id) else {
+            return Err(format!("pattern {:02X} does not exist", id.value()));
+        };
+        if row >= pattern.row_count() {
+            return Err(format!(
+                "row {row} is outside pattern {:02X}'s {} rows",
+                id.value(),
+                pattern.row_count()
+            ));
+        }
+        self.ensure_macros()?;
+        self.stop_playback_and_release();
+        self.current = id;
+        self.start_playback_at(row);
+        Ok(())
+    }
+
+    /// Clears transient edit state and clamps the cursor after a pattern
+    /// mutation performed outside the TUI.
+    pub fn repl_after_pattern_change(&mut self) {
+        self.sync_edit();
+        self.after_pattern_change();
+        self.repl_mark_mutated();
+    }
+
+    /// Re-selects a pattern after a deletion changed its geometry.
+    pub fn repl_select_pattern(&mut self, id: PatternId) {
+        self.select_pattern(id);
+    }
+
+    /// Returns a conflict message when the code editor buffer differs from the
+    /// stored module source.
+    pub fn repl_editor_conflict(&self, id: u8) -> Option<String> {
+        if self.module_id != id || self.module_readonly(id) {
+            return None;
+        }
+        let stored = self.project.modules.get(&id).cloned().unwrap_or_default();
+        if self.code.text() != stored {
+            Some(format!(
+                "module {id:02X} has unsaved code-editor changes; finish or cancel the editor change first"
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Replaces the code-editor buffer. Intended for REPL integration tests
+    /// that need to simulate an unsaved editor change.
+    pub fn repl_set_editor_text(&mut self, text: &str) {
+        self.code = CodeEditor::from_text(text);
+    }
+
+    /// Applies a module source from the REPL, validating the whole module map
+    /// first and refreshing the editor when the module is open.
+    pub fn repl_apply_module_source(&mut self, id: u8, source: String) -> Result<(), String> {
+        if let Some(conflict) = self.repl_editor_conflict(id) {
+            return Err(conflict);
+        }
+        let mut modules = self.project.modules.clone();
+        modules.insert(id, source.clone());
+        let commands = match self.macro_source.as_mut() {
+            Some(source) => source.reload(&modules)?,
+            None => return Err("no macro runtime is available".to_string()),
+        };
+        self.project.modules.insert(id, source.clone());
+        self.project_commands = commands;
+        self.macros_dirty = false;
+        if self.module_id == id {
+            self.code = CodeEditor::from_text(&source);
+            self.code_scroll = 0;
+        }
+        self.repl_mark_mutated();
+        Ok(())
+    }
+
+    /// Deletes a user module from the REPL.
+    pub fn repl_delete_module(&mut self, id: u8) -> Result<(), String> {
+        if id == 0 {
+            return Err("module 00 cannot be deleted".to_string());
+        }
+        if let Some(conflict) = self.repl_editor_conflict(id) {
+            return Err(conflict);
+        }
+        let mut modules = self.project.modules.clone();
+        modules.remove(&id);
+        let commands = match self.macro_source.as_mut() {
+            Some(source) => source.reload(&modules)?,
+            None => return Err("no macro runtime is available".to_string()),
+        };
+        self.project.modules.remove(&id);
+        self.project_commands = commands;
+        self.macros_dirty = false;
+        if self.module_id == id {
+            self.module_id = 0;
+            self.code =
+                CodeEditor::from_text(&self.project.modules.get(&0).cloned().unwrap_or_default());
+            self.code_scroll = 0;
+        }
+        self.repl_mark_mutated();
+        Ok(())
+    }
+
+    /// Rebuilds and validates the complete macro runtime from the current
+    /// module sources. Rejects when the open editor buffer has unsaved changes.
+    pub fn repl_reload_all(&mut self) -> Result<(), String> {
+        if let Some(conflict) = self.repl_editor_conflict(self.module_id) {
+            return Err(conflict);
+        }
+        let commands = match self.macro_source.as_mut() {
+            Some(source) => source.reload(&self.project.modules)?,
+            None => return Err("no macro runtime is available".to_string()),
+        };
+        self.project_commands = commands;
+        self.macros_dirty = false;
+        Ok(())
+    }
+
+    /// Validates an alternative module map without changing the active one.
+    pub fn repl_validate_modules(
+        &mut self,
+        modules: &std::collections::BTreeMap<u8, String>,
+    ) -> Result<Vec<ProjectCommand>, String> {
+        match self.macro_source.as_mut() {
+            Some(source) => source.reload(modules),
+            None => Err("no macro runtime is available".to_string()),
+        }
+    }
+
     // --- File operations ------------------------------------------------------
 
     fn resolve_path(&self, given: Option<String>) -> Result<PathBuf, String> {
@@ -3041,16 +3203,22 @@ impl App {
 
     /// Starts playback from the configured start row.
     pub fn start_playback(&mut self) {
+        self.start_playback_at(self.play_start_row);
+    }
+
+    /// Starts playback from an explicit row without changing the configured
+    /// start row.
+    pub fn start_playback_at(&mut self, start_row: usize) {
         if self.ensure_macros().is_err() {
             return;
         }
         let events = self.render();
         let tpb = self.project.composition.tpb();
         let row_len = row_ticks(tpb, self.pattern().lpb()).unwrap_or(1) as u64;
-        let base = self.play_start_row as u64 * row_len;
+        let base = start_row as u64 * row_len;
         self.play_end_tick = self.pattern().row_count() as u64 * row_len;
         self.play_tick = base;
-        self.play_current_row = self.play_start_row;
+        self.play_current_row = start_row;
         self.play_next = events
             .iter()
             .position(|e| e.tick >= base)
@@ -3059,9 +3227,7 @@ impl App {
         self.play_micros = 0.0;
         self.playing = true;
         if self.mode.follows_playback() {
-            self.row = self
-                .play_start_row
-                .min(self.pattern().row_count().saturating_sub(1));
+            self.row = start_row.min(self.pattern().row_count().saturating_sub(1));
         }
     }
 

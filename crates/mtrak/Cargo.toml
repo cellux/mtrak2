@@ -22,6 +22,7 @@ mtrak-engine.workspace = true
 mtrak-midi-io.workspace = true
 mtrak-midi.workspace = true
 mtrak-tui.workspace = true
+mtrak-repl.workspace = true
 
 [lints]
 workspace = true

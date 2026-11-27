@@ -1,0 +1,24 @@
+[package]
+name = "mtrak-repl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local HTTP Fennel REPL for mtrak."
+publish = false
+
+[dependencies]
+mtrak-core.workspace = true
+mtrak-engine.workspace = true
+mtrak-midi-io.workspace = true
+mtrak-tui.workspace = true
+thiserror.workspace = true
+serde_json = "1"
+
+[dependencies.mlua]
+version = "0.10"
+features = ["lua54", "vendored"]
+
+[lints]
+workspace = true

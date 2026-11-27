@@ -64,7 +64,108 @@ const SETUP_GLOBALS: &[&str] = &["register-command"];
 pub struct FennelCompiler {
     lua: Lua,
     fennel: Table,
+    replace_form_fn: Function,
 }
+
+/// Finds exactly one occurrence of `prefix` in `source` and replaces its source
+/// span with `replacement`, preserving all source outside the span.
+const REPLACE_FORM_SCRIPT: &str = r#"
+return function(fennel, source, prefix, replacement)
+  local function parse_one(str)
+    local iter = fennel.parser(str, "prefix")
+    local ok, form = iter()
+    if not ok then return nil end
+    local ok2 = iter()
+    if ok2 then return nil end
+    return form
+  end
+
+  local prefix_form = parse_one(prefix)
+  if not prefix_form then return nil, "invalid prefix form" end
+  -- Only tables carry the source metadata needed to locate a span.
+  if type(prefix_form) ~= "table" then
+    return nil, "prefix literal has no source position metadata"
+  end
+
+  local meta_keys = {
+    line = true, col = true, filename = true, byteend = true, bytestart = true,
+    endline = true, endcol = true, closer = true,
+  }
+
+  -- Fennel gives lists a shared metatable and tables a unique metatable that
+  -- carries the literal's source position. Compare sequence-ness rather than
+  -- metatable identity so plain tables and maps still match structurally.
+  local function sequence_metatable(form)
+    local mt = getmetatable(form)
+    if type(mt) == "table" and mt.sequence then return mt.sequence end
+    return nil
+  end
+
+  local function ast_equal(a, b)
+    if type(a) ~= type(b) then return false end
+    if type(a) ~= "table" then return a == b end
+    if sequence_metatable(a) ~= sequence_metatable(b) then return false end
+    local keys = {}
+    for k in pairs(a) do
+      if not (type(k) == "string" and meta_keys[k]) then
+        keys[k] = true
+      end
+    end
+    for k in pairs(b) do
+      if not (type(k) == "string" and meta_keys[k]) then
+        if not keys[k] then return false end
+        keys[k] = nil
+      end
+    end
+    if next(keys) then return false end
+    for k in pairs(a) do
+      if not (type(k) == "string" and meta_keys[k]) then
+        if not ast_equal(a[k], b[k]) then return false end
+      end
+    end
+    return true
+  end
+
+  local matches = {}
+  local function walk(form)
+    if type(form) ~= "table" then return end
+    if ast_equal(form, prefix_form) then
+      table.insert(matches, form)
+    end
+    for k, v in pairs(form) do
+      if not (type(k) == "string" and meta_keys[k]) then
+        walk(v)
+      end
+    end
+  end
+
+  local iter = fennel.parser(source, "module")
+  while true do
+    local ok, form = iter()
+    if not ok then break end
+    walk(form)
+  end
+
+  if #matches == 0 then return nil, "no matching form" end
+  if #matches > 1 then return nil, "multiple matching forms" end
+
+  local match = matches[1]
+  -- Lists carry positions on the form itself; table literals keep them in the
+  -- unique metatable. Sequence literals lose their position because Fennel
+  -- moves it into the shared sequence metatable, so they cannot be replaced.
+  local start, finish = match.bytestart, match.byteend
+  if not start then
+    local mt = getmetatable(match)
+    if type(mt) == "table" and not mt.sequence then
+      start, finish = mt.bytestart, mt.byteend
+    end
+  end
+  if not start or not finish then
+    return nil, "matched form has no source position metadata"
+  end
+  return source:sub(1, start - 1) .. replacement .. source:sub(finish + 1)
+end
+"#;
 
 impl FennelCompiler {
     /// Loads the embedded compiler and locks down its state.
@@ -81,7 +182,16 @@ impl FennelCompiler {
             .eval()
             .map_err(compile_error)?;
         restrict(&lua).map_err(compile_error)?;
-        Ok(FennelCompiler { lua, fennel })
+        let replace_form_fn: Function = lua
+            .load(REPLACE_FORM_SCRIPT)
+            .set_name("replace-form")
+            .eval()
+            .map_err(compile_error)?;
+        Ok(FennelCompiler {
+            lua,
+            fennel,
+            replace_form_fn,
+        })
     }
 
     /// The compiler's reported Fennel version.
@@ -98,20 +208,72 @@ impl FennelCompiler {
         module_id: u8,
         allow_register: bool,
     ) -> Result<String, CompileError> {
+        self.compile_with(
+            source,
+            &source_name(module_id),
+            allowed_globals(allow_register).into_iter(),
+        )
+    }
+
+    /// Compiles a REPL form into correlated Lua source.
+    ///
+    /// The synthetic source name is `repl`, so diagnostics refer to the
+    /// submitted form without pretending to be a module file.
+    pub fn compile_repl(
+        &self,
+        source: &str,
+        allowed_globals: &[String],
+    ) -> Result<String, CompileError> {
+        self.compile_with(
+            source,
+            "repl",
+            allowed_globals.iter().map(|name| name.as_str()),
+        )
+    }
+
+    /// Replaces exactly one occurrence of `prefix` in `source` with
+    /// `replacement`, preserving all source outside the matched span.
+    pub fn replace_form(
+        &self,
+        source: &str,
+        prefix: &str,
+        replacement: &str,
+    ) -> Result<String, CompileError> {
+        let result: mlua::Result<(Option<String>, Option<String>)> =
+            self.replace_form_fn
+                .call((self.fennel.clone(), source, prefix, replacement));
+        match result {
+            Ok((Some(new_source), _)) => Ok(new_source),
+            Ok((None, Some(message))) => Err(CompileError { message }),
+            Ok((None, None)) => Err(CompileError {
+                message: "replace-form failed".to_string(),
+            }),
+            Err(error) => Err(compile_error(error)),
+        }
+    }
+
+    fn compile_with<'a>(
+        &self,
+        source: &str,
+        filename: &str,
+        allowed_globals: impl Iterator<Item = &'a str>,
+    ) -> Result<String, CompileError> {
         let compile_string: Function = self.fennel.get("compile-string").map_err(compile_error)?;
         let opts = self.lua.create_table().map_err(compile_error)?;
-        opts.set("filename", source_name(module_id))
-            .map_err(compile_error)?;
+        opts.set("filename", filename).map_err(compile_error)?;
         // Source correlation pads the generated Lua so its line numbers match
-        // the Fennel lines shown in the Code screen.
+        // the Fennel lines shown in the Code screen or REPL form.
         opts.set("correlate", true).map_err(compile_error)?;
         // `unfriendly` and `error-pinpoint` keep diagnostics free of terminal
         // escape codes and suggestion chatter.
         opts.set("unfriendly", true).map_err(compile_error)?;
         opts.set("error-pinpoint", false).map_err(compile_error)?;
         opts.set("source", source).map_err(compile_error)?;
-        opts.set("allowedGlobals", allowed_globals(allow_register))
-            .map_err(compile_error)?;
+        let allowed = self.lua.create_table().map_err(compile_error)?;
+        for (index, name) in allowed_globals.enumerate() {
+            allowed.set(index + 1, name).map_err(compile_error)?;
+        }
+        opts.set("allowedGlobals", allowed).map_err(compile_error)?;
         let (lua_source, _sourcemap): (String, Table) =
             compile_string.call((source, opts)).map_err(compile_error)?;
         Ok(lua_source)
@@ -220,7 +382,33 @@ fn is_valid_lua_identifier(name: &str) -> bool {
 
 fn compile_error(error: mlua::Error) -> CompileError {
     CompileError {
-        message: error.to_string(),
+        message: error_message(error),
+    }
+}
+
+/// Extracts the Fennel diagnostic from an `mlua` error.
+///
+/// `mlua` renders `RuntimeError` as "runtime error: {message}" and wraps errors
+/// raised by Rust or Lua callbacks in `CallbackError`, whose `Display` appends a
+/// Lua stack traceback. The diagnostic is the innermost cause, so unwrap it and
+/// drop the redundant prefix.
+fn error_message(error: mlua::Error) -> String {
+    let message = match error {
+        mlua::Error::RuntimeError(message) => message,
+        mlua::Error::CallbackError { cause, .. } => match std::sync::Arc::try_unwrap(cause) {
+            Ok(cause) => error_message(cause),
+            Err(cause) => cause.to_string(),
+        },
+        other => other.to_string(),
+    };
+    strip_traceback(message)
+}
+
+/// Removes the Lua stack traceback that `mlua` appends to diagnostics.
+fn strip_traceback(message: String) -> String {
+    match message.find("\nstack traceback:") {
+        Some(index) => message[..index].to_string(),
+        None => message,
     }
 }
 
@@ -306,6 +494,108 @@ mod tests {
             error.message.contains("module 40.fnl:3:"),
             "{}",
             error.message
+        );
+    }
+
+    #[test]
+    fn compiles_repl_forms_with_the_repl_source_name() {
+        let compiler = FennelCompiler::new().unwrap();
+        let allowed = vec!["mtrak".to_string(), "print".to_string()];
+        let lua = compiler
+            .compile_repl("(mtrak.patterns.list)", &allowed)
+            .unwrap();
+        assert!(lua.contains("mtrak.patterns.list"), "{lua}");
+        let error = compiler
+            .compile_repl("(unknown-global 1)", &allowed)
+            .unwrap_err();
+        assert!(error.message.contains("repl:1:"), "{}", error.message);
+    }
+
+    #[test]
+    fn repl_compilation_honours_the_supplied_allowlist() {
+        let compiler = FennelCompiler::new().unwrap();
+        let allowed = vec!["mtrak".to_string()];
+        assert!(compiler.compile_repl("(mtrak.settings)", &allowed).is_ok());
+        let error = compiler.compile_repl("(print 1)", &allowed).unwrap_err();
+        assert!(
+            error.message.contains("unknown identifier: print"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn replace_form_preserves_source_outside_the_match() {
+        let compiler = FennelCompiler::new().unwrap();
+        let source = "(fn run [a1]\n  (emit 0x90 a1 100))\n\n(fn other [] (emit 1 2 3))\n";
+        let prefix = "(fn run [a1]\n  (emit 0x90 a1 100))";
+        let replacement = "(fn run [a1]\n  (emit 0x91 a1 101))";
+        let updated = compiler.replace_form(source, prefix, replacement).unwrap();
+        assert!(updated.contains("(emit 0x91 a1 101)"), "{updated}");
+        assert!(updated.contains("(fn other [] (emit 1 2 3))"), "{updated}");
+    }
+
+    #[test]
+    fn replace_form_matches_table_and_map_literals() {
+        let compiler = FennelCompiler::new().unwrap();
+        let source = "(local M {:a 1})\n\n(fn run [] M)\n";
+        let updated = compiler.replace_form(source, "{:a 1}", "{:a 2}").unwrap();
+        assert_eq!(updated, "(local M {:a 2})\n\n(fn run [] M)\n");
+        let empty = compiler
+            .replace_form("(local M {})", "{}", "{:b 3}")
+            .unwrap();
+        assert_eq!(empty, "(local M {:b 3})");
+    }
+
+    #[test]
+    fn replace_form_rejects_literal_prefixes_with_diagnostics() {
+        let compiler = FennelCompiler::new().unwrap();
+        let error = compiler
+            .replace_form("(fn run [] 42)", "42", "43")
+            .unwrap_err();
+        assert!(
+            error.message.contains("no source position"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn replace_form_rejects_sequence_literals_with_diagnostics() {
+        let compiler = FennelCompiler::new().unwrap();
+        let error = compiler
+            .replace_form("(local M [1])", "[1]", "[2]")
+            .unwrap_err();
+        assert!(
+            error.message.contains("no source position"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn replace_form_rejects_zero_and_multiple_matches() {
+        let compiler = FennelCompiler::new().unwrap();
+        let source = "(fn run [a1] (emit 0x90 a1 100))\n";
+        let zero = compiler
+            .replace_form(source, "(fn missing [] 1)", "(fn missing [] 2)")
+            .unwrap_err();
+        assert!(
+            zero.message.contains("no matching form"),
+            "{}",
+            zero.message
+        );
+        let multiple = compiler
+            .replace_form(
+                "(fn run [a1] (emit 0x90 a1 100) (emit 0x90 a1 100))",
+                "(emit 0x90 a1 100)",
+                "(emit 0x91 a1 101)",
+            )
+            .unwrap_err();
+        assert!(
+            multiple.message.contains("multiple matching forms"),
+            "{}",
+            multiple.message
         );
     }
 

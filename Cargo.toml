@@ -6,6 +6,7 @@ members = [
     "crates/mtrak-midi-io",
     "crates/mtrak-midi",
     "crates/mtrak-tui",
+    "crates/mtrak-repl",
     "crates/mtrak",
 ]
 
@@ -24,6 +25,7 @@ mtrak-engine = { path = "crates/mtrak-engine" }
 mtrak-midi-io = { path = "crates/mtrak-midi-io" }
 mtrak-midi = { path = "crates/mtrak-midi" }
 mtrak-tui = { path = "crates/mtrak-tui" }
+mtrak-repl = { path = "crates/mtrak-repl" }
 
 thiserror = "2"
 ratatui = "0.28"
