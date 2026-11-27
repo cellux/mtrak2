@@ -1,15 +1,18 @@
-//! Sandboxed Lua macro runtime.
+//! Sandboxed Fennel macro runtime.
 //!
-//! Modules are compiled with an empty `_ENV` that exposes only the injected API
-//! and a curated standard library, so there is no filesystem, network, process,
-//! `os`, `io`, `debug`, `package`, or FFI access (decision D-004). Each macro
-//! runs as a coroutine that the scheduler resumes once per tick; instruction and
+//! Every module is compiled from Fennel to correlated Lua by the separate,
+//! restricted [`FennelCompiler`](crate::fennel::FennelCompiler) state, then the
+//! generated Lua is evaluated in an empty `_ENV` that exposes only the injected
+//! API and a curated standard library. There is therefore no filesystem,
+//! network, process, `os`, `io`, `debug`, `package`, or FFI access (decision
+//! D-004), and Fennel syntax cannot bypass the sandbox (D-102). Each macro runs
+//! as a coroutine that the scheduler resumes once per tick; instruction and
 //! memory limits keep a runaway macro from corrupting engine state (D-026).
 //!
-//! The remaining-gaps milestone migrated the built-in macros to inspectable Lua
-//! modules (`01` trigger, `02` Q8.8 tempo shorthand), made module `00` an
-//! editable project/library module whose setup side effects run once, and added
-//! numeric-hexadecimal `require` with caching and circular-dependency checks.
+//! [`MacroRuntime`] owns both the compiler and the Lua execution state. The
+//! built-in macros (`01` trigger, `02` Q8.8 tempo shorthand), the module `00`
+//! setup/library module, and numeric-hexadecimal `require` with caching and
+//! circular-dependency checks all keep their existing semantics.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -23,6 +26,7 @@ use mtrak_core::modules::BUILTIN_MODULES;
 use mtrak_core::settings::{Scale, Settings};
 use mtrak_core::timing::Ticks;
 
+use crate::fennel::{fennel_global_name, FennelCompiler};
 use crate::macros::{Macro, MacroAction, MacroCtx, MacroFactory, SettingChange};
 use crate::rng::{self, SplitMix64};
 
@@ -35,12 +39,23 @@ const SAFE_GLOBALS: &[&str] = &[
     "assert", "select", "pcall", "xpcall",
 ];
 
-/// Errors from the Lua runtime.
+/// Errors from the Fennel/Lua macro runtime.
 #[derive(Debug, thiserror::Error)]
-pub enum LuaError {
+pub enum MacroError {
     /// An error propagated from the embedded Lua state.
     #[error("lua error: {0}")]
     Lua(#[from] mlua::Error),
+    /// The embedded Fennel compiler could not be initialized.
+    #[error("fennel compiler initialization failed: {0}")]
+    Compiler(String),
+    /// The Fennel source could not be compiled for a module.
+    #[error("fennel compile error in module {id:02X}: {message}")]
+    Compile {
+        /// The module whose source failed to compile.
+        id: u8,
+        /// The Fennel diagnostic, including the synthetic source name and line.
+        message: String,
+    },
     /// The macro ID is not a user module ID (`40`–`7F`).
     #[error("macro id {0:#04X} is not a user macro id")]
     NotUserMacro(u8),
@@ -64,9 +79,9 @@ pub struct RegisteredCommand {
     pub description: Option<String>,
 }
 
-/// Deterministic resource limits for the Lua runtime.
+/// Deterministic resource limits for the Lua execution state.
 #[derive(Clone, Copy, Debug)]
-pub struct LuaLimits {
+pub struct MacroLimits {
     /// Maximum Lua heap in bytes.
     pub memory_bytes: usize,
     /// Maximum VM instructions a single macro may execute per resume.
@@ -75,9 +90,9 @@ pub struct LuaLimits {
     pub max_live_coroutines: usize,
 }
 
-impl Default for LuaLimits {
+impl Default for MacroLimits {
     fn default() -> Self {
-        LuaLimits {
+        MacroLimits {
             memory_bytes: 16 * 1024 * 1024,
             instructions_per_tick: 1_000_000,
             max_live_coroutines: 64,
@@ -109,21 +124,25 @@ struct Inner {
     commands: Rc<RefCell<Vec<RegisteredCommand>>>,
     handlers: Rc<RefCell<HashMap<String, Function>>>,
     fuel: Rc<Cell<u64>>,
-    limits: LuaLimits,
+    limits: MacroLimits,
     live: usize,
 }
 
-/// The shared Lua runtime used to create macro coroutines.
+/// The shared Fennel compiler and Lua execution runtime used to create macro
+/// coroutines.
 #[derive(Clone)]
-pub struct LuaRuntime {
+pub struct MacroRuntime {
     lua: Lua,
+    compiler: FennelCompiler,
     inner: Rc<RefCell<Inner>>,
 }
 
-impl LuaRuntime {
+impl MacroRuntime {
     /// Creates a new sandboxed runtime with the given limits and the built-in
     /// module sources pre-registered.
-    pub fn new(limits: LuaLimits) -> Result<Self, LuaError> {
+    pub fn new(limits: MacroLimits) -> Result<Self, MacroError> {
+        let compiler =
+            FennelCompiler::new().map_err(|error| MacroError::Compiler(error.message))?;
         let lua = Lua::new();
         lua.set_memory_limit(limits.memory_bytes)?;
         let mut sources = HashMap::new();
@@ -142,10 +161,18 @@ impl LuaRuntime {
             limits,
             live: 0,
         };
-        Ok(LuaRuntime {
+        Ok(MacroRuntime {
             lua,
+            compiler,
             inner: Rc::new(RefCell::new(inner)),
         })
+    }
+
+    /// The embedded compiler's reported Fennel version.
+    pub fn fennel_version(&self) -> String {
+        self.compiler
+            .version()
+            .unwrap_or_else(|_| "unknown".to_string())
     }
 
     /// Reseeds the global random series.
@@ -168,26 +195,33 @@ impl LuaRuntime {
     /// Loads a user macro module (`40`–`7F`) defining `run(arg1, arg2, ctx)`.
     ///
     /// The module is evaluated immediately so syntax errors surface at load.
-    pub fn load_module(&self, id: u8, source: &str) -> Result<(), LuaError> {
+    pub fn load_module(&self, id: u8, source: &str) -> Result<(), MacroError> {
         if !macro_id::is_user(id) {
-            return Err(LuaError::NotUserMacro(id));
+            return Err(MacroError::NotUserMacro(id));
         }
         self.set_module_source(id, source);
-        ensure_module(&self.lua, &self.inner, id, false).map(|_| ())
+        ensure_module(&self.lua, &self.inner, &self.compiler, id, false).map(|_| ())
     }
 
     /// Executes the project setup module (`00`), which may register commands and
     /// perform one-time side effects. Its returned value is cached for
     /// `require(0x00)`.
-    pub fn run_setup(&self, source: &str) -> Result<(), LuaError> {
+    pub fn run_setup(&self, source: &str) -> Result<(), MacroError> {
         self.set_module_source(macro_id::SETUP, source);
-        ensure_module(&self.lua, &self.inner, macro_id::SETUP, true).map(|_| ())
+        ensure_module(
+            &self.lua,
+            &self.inner,
+            &self.compiler,
+            macro_id::SETUP,
+            true,
+        )
+        .map(|_| ())
     }
 
     /// Clears every cached module value and re-evaluates all stored sources.
     ///
     /// Used by the explicit `F5` reload path in the Code screen.
-    pub fn reload(&self) -> Result<(), LuaError> {
+    pub fn reload(&self) -> Result<(), MacroError> {
         {
             let mut inner = self.inner.borrow_mut();
             inner.cache.clear();
@@ -200,7 +234,7 @@ impl LuaRuntime {
     }
 
     /// Evaluates every stored module source, surfacing the first error.
-    pub fn validate(&self) -> Result<(), LuaError> {
+    pub fn validate(&self) -> Result<(), MacroError> {
         let ids: Vec<u8> = {
             let inner = self.inner.borrow();
             let mut ids: Vec<u8> = inner.sources.keys().copied().collect();
@@ -209,7 +243,7 @@ impl LuaRuntime {
         };
         for id in ids {
             let allow_register = id == macro_id::SETUP;
-            ensure_module(&self.lua, &self.inner, id, allow_register)?;
+            ensure_module(&self.lua, &self.inner, &self.compiler, id, allow_register)?;
         }
         Ok(())
     }
@@ -230,29 +264,29 @@ impl LuaRuntime {
     }
 
     /// Creates a macro coroutine for a built-in or user macro call.
-    pub fn create_macro(&self, call: MacroCall) -> Result<LuaMacro, LuaError> {
+    pub fn create_macro(&self, call: MacroCall) -> Result<LuaMacro, MacroError> {
         let id = call.id;
         let defined_builtin = macro_id::is_defined_builtin(id);
         if !defined_builtin && !macro_id::is_user(id) {
-            return Err(LuaError::ReservedMacro(id));
+            return Err(MacroError::ReservedMacro(id));
         }
         {
             let inner = self.inner.borrow();
             if inner.live >= inner.limits.max_live_coroutines {
-                return Err(LuaError::TooManyCoroutines);
+                return Err(MacroError::TooManyCoroutines);
             }
             if !inner.sources.contains_key(&id) {
-                return Err(LuaError::UnknownModule(id));
+                return Err(MacroError::UnknownModule(id));
             }
         }
-        ensure_module(&self.lua, &self.inner, id, false)?;
+        ensure_module(&self.lua, &self.inner, &self.compiler, id, false)?;
         let run = self
             .inner
             .borrow()
             .modules
             .get(&id)
             .cloned()
-            .ok_or(LuaError::UnknownModule(id))?;
+            .ok_or(MacroError::UnknownModule(id))?;
         let body: Function = self
             .lua
             .load("local run = ...; return function(a1, a2, ctx) return run(a1, a2, ctx) end")
@@ -285,25 +319,26 @@ impl LuaRuntime {
     }
 }
 
-/// Evaluates a module source (once) and returns its cached return value.
+/// Compiles and evaluates a module source (once) and returns its cached value.
 fn ensure_module(
     lua: &Lua,
     inner: &Rc<RefCell<Inner>>,
+    compiler: &FennelCompiler,
     id: u8,
     allow_register: bool,
-) -> Result<Value, LuaError> {
+) -> Result<Value, MacroError> {
     {
         let state = inner.borrow();
         if let Some(value) = state.cache.get(&id) {
             return Ok(value.clone());
         }
         if state.loading.contains(&id) {
-            return Err(LuaError::Lua(mlua::Error::RuntimeError(format!(
+            return Err(MacroError::Lua(mlua::Error::RuntimeError(format!(
                 "circular require of module {id:02X}"
             ))));
         }
         if !state.sources.contains_key(&id) {
-            return Err(LuaError::UnknownModule(id));
+            return Err(MacroError::UnknownModule(id));
         }
     }
     let source = inner
@@ -311,14 +346,22 @@ fn ensure_module(
         .sources
         .get(&id)
         .cloned()
-        .ok_or(LuaError::UnknownModule(id))?;
+        .ok_or(MacroError::UnknownModule(id))?;
     inner.borrow_mut().loading.insert(id);
 
-    let outcome = (|| -> Result<Value, LuaError> {
-        let env = make_env(lua, inner, allow_register)?;
+    let outcome = (|| -> Result<Value, MacroError> {
+        // Compile first: a Fennel error is a load/validation error and must not
+        // leave a cached module or a stale loading marker behind.
+        let lua_source = compiler
+            .compile(&source, id, allow_register)
+            .map_err(|error| MacroError::Compile {
+                id,
+                message: error.message,
+            })?;
+        let env = make_env(lua, inner, compiler, allow_register)?;
         let value: Value = lua
-            .load(&source)
-            .set_name(format!("module {id:02X}"))
+            .load(&lua_source)
+            .set_name(crate::fennel::source_name(id))
             .set_environment(env.clone())
             .eval()?;
         let run = match &value {
@@ -343,16 +386,35 @@ fn ensure_module(
 fn make_env(
     lua: &Lua,
     inner: &Rc<RefCell<Inner>>,
+    compiler: &FennelCompiler,
     allow_register: bool,
-) -> Result<Table, LuaError> {
+) -> Result<Table, MacroError> {
     let env = lua.create_table()?;
-    install_api(lua, inner, &env, allow_register)?;
+    install_api(lua, inner, compiler, &env, allow_register)?;
     Ok(env)
+}
+
+/// Binds an API value under both its Fennel name and its mangled global name.
+///
+/// Fennel compiles kebab-case globals such as `get-setting` to the mangled
+/// identifier `__fnl_global__get_2dsetting`, so the execution environment must
+/// expose the mangled spelling for generated Lua to resolve it.
+fn bind<V>(env: &Table, name: &str, value: V) -> mlua::Result<()>
+where
+    V: mlua::IntoLua + Clone,
+{
+    env.set(name, value.clone())?;
+    let mangled = fennel_global_name(name);
+    if mangled != name {
+        env.set(mangled, value)?;
+    }
+    Ok(())
 }
 
 fn install_api(
     lua: &Lua,
     inner: &Rc<RefCell<Inner>>,
+    compiler: &FennelCompiler,
     env: &Table,
     allow_register: bool,
 ) -> mlua::Result<()> {
@@ -382,8 +444,9 @@ fn install_api(
     )?;
 
     let shared_sysex = shared.clone();
-    env.set(
-        "emit_sysex",
+    bind(
+        env,
+        "emit-sysex",
         lua.create_function(move |_, data: Vec<u8>| {
             shared_sysex
                 .borrow_mut()
@@ -394,8 +457,9 @@ fn install_api(
     )?;
 
     let shared_meta = shared.clone();
-    env.set(
-        "emit_meta",
+    bind(
+        env,
+        "emit-meta",
         lua.create_function(move |_, (kind, data): (u8, Vec<u8>)| {
             shared_meta
                 .borrow_mut()
@@ -420,8 +484,9 @@ fn install_api(
     )?;
 
     let shared_stop = shared.clone();
-    env.set(
-        "stop_track",
+    bind(
+        env,
+        "stop-track",
         lua.create_function(move |_, include: Option<bool>| {
             shared_stop
                 .borrow_mut()
@@ -434,8 +499,9 @@ fn install_api(
     )?;
 
     let shared_get = shared.clone();
-    env.set(
-        "get_setting",
+    bind(
+        env,
+        "get-setting",
         lua.create_function(move |_, name: String| {
             let settings = shared_get.borrow().settings;
             Ok(settings
@@ -445,8 +511,9 @@ fn install_api(
     )?;
 
     let shared_set = shared.clone();
-    env.set(
-        "set_setting",
+    bind(
+        env,
+        "set-setting",
         lua.create_function(move |_, (name, value): (String, Value)| {
             let Some(change) = setting_change(&name, &value) else {
                 return Ok(false);
@@ -468,6 +535,7 @@ fn install_api(
     env.set("wait", wait)?;
 
     let require_inner = inner.clone();
+    let require_compiler = compiler.clone();
     env.set(
         "require",
         lua.create_function(move |lua, id: i64| {
@@ -476,7 +544,7 @@ fn install_api(
                     "require id must be in 0x00..=0xFF".to_string(),
                 ));
             }
-            ensure_module(lua, &require_inner, id as u8, false)
+            ensure_module(lua, &require_inner, &require_compiler, id as u8, false)
                 .map_err(|error| mlua::Error::RuntimeError(error.to_string()))
         })?,
     )?;
@@ -503,8 +571,9 @@ fn install_api(
     if allow_register {
         let commands = commands.clone();
         let handlers = handlers.clone();
-        env.set(
-            "register_command",
+        bind(
+            env,
+            "register-command",
             lua.create_function(move |_, args: MultiValue| {
                 let mut it = args.into_iter();
                 let name = it.next().and_then(|v| v.as_string_lossy()).ok_or_else(|| {
@@ -570,7 +639,7 @@ impl LuaMacro {
     fn resume_inner(
         &mut self,
         ctx: &mut MacroCtx,
-    ) -> Result<(ResumeOutcome, Vec<MacroAction>), LuaError> {
+    ) -> Result<(ResumeOutcome, Vec<MacroAction>), MacroError> {
         let shared = {
             let state = self.inner.borrow();
             state.shared.clone()
@@ -622,25 +691,25 @@ impl LuaMacro {
             }
             Err(error) => {
                 finish(&self.inner);
-                Err(LuaError::Lua(error))
+                Err(MacroError::Lua(error))
             }
         }
     }
 }
 
 /// A [`MacroFactory`] that creates Lua macro coroutines.
-pub struct LuaMacroFactory {
-    runtime: LuaRuntime,
+pub struct RuntimeMacroFactory {
+    runtime: MacroRuntime,
 }
 
-impl LuaMacroFactory {
+impl RuntimeMacroFactory {
     /// Creates a factory backed by `runtime`.
-    pub fn new(runtime: LuaRuntime) -> Self {
-        LuaMacroFactory { runtime }
+    pub fn new(runtime: MacroRuntime) -> Self {
+        RuntimeMacroFactory { runtime }
     }
 }
 
-impl MacroFactory for LuaMacroFactory {
+impl MacroFactory for RuntimeMacroFactory {
     fn set_seed(&mut self, seed: u64) {
         self.runtime.set_seed(seed);
     }
@@ -759,9 +828,9 @@ mod tests {
         composition
     }
 
-    fn run(composition: Composition, runtime: &LuaRuntime) -> Engine {
+    fn run(composition: Composition, runtime: &MacroRuntime) -> Engine {
         let mut engine = Engine::new(composition);
-        engine.set_macro_factory(Box::new(LuaMacroFactory::new(runtime.clone())));
+        engine.set_macro_factory(Box::new(RuntimeMacroFactory::new(runtime.clone())));
         engine.start(PatternId(0));
         engine.run();
         engine
@@ -781,20 +850,26 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_exposes_no_dangerous_globals() {
-        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+    fn sandbox_rejects_and_hides_dangerous_globals() {
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
+        // A forbidden global is rejected during compilation, not at runtime.
+        let error = runtime
+            .load_module(0x40, r#"(fn run [a1 a2 ctx] (os.execute "ls"))"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown identifier: os"), "{error}");
+
+        // And it is not visible in the execution environment either.
         runtime
             .load_module(
                 0x40,
                 r#"
-                return { run = function(a1, a2, ctx)
-                    local names = {"os","io","debug","package","load","loadfile","dofile","collectgarbage","_G"}
-                    local leaked = 0
-                    for _, n in ipairs(names) do
-                        if _ENV[n] ~= nil then leaked = leaked + 1 end
-                    end
-                    emit(0x90, leaked, 1)
-                end }
+                (fn run [a1 a2 ctx]
+                  (var leaked 0)
+                  (each [_ n (ipairs ["os" "io" "debug" "package" "load"
+                                      "loadfile" "dofile" "collectgarbage" "_G"])]
+                    (when (. _ENV n) (set leaked (+ leaked 1))))
+                  (emit 0x90 leaked 1))
                 "#,
             )
             .unwrap();
@@ -807,17 +882,36 @@ mod tests {
     }
 
     #[test]
+    fn compile_errors_report_the_fennel_source_and_cache_nothing() {
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
+        let error = runtime
+            .load_module(0x40, "(fn run [a1]\n  (emit 0x90 a1")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("module 40.fnl"), "{error}");
+        assert!(error.contains("Parse error"), "{error}");
+        // A failed compilation must not leave a cached value behind.
+        assert!(runtime.module_value(0x40).is_none());
+
+        // The same module id can be loaded successfully afterwards.
+        runtime
+            .load_module(0x40, "(fn run [a1 a2 ctx] (emit 0x90 a1 100))")
+            .unwrap();
+        let engine = run(pattern_with_macro(0x40, 60, 0), &runtime);
+        assert_eq!(notes(&engine), vec![(0, 0, 60)]);
+    }
+
+    #[test]
     fn macros_emit_and_wait_in_beats() {
-        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
         runtime
             .load_module(
                 0x41,
                 r#"
-                return { run = function(a1, a2, ctx)
-                    emit(0x90, a1, 100)
-                    wait(4)
-                    emit(0x91, a2, 100)
-                end }
+                (fn run [a1 a2 ctx]
+                  (emit 0x90 a1 100)
+                  (wait 4)
+                  (emit 0x91 a2 100))
                 "#,
             )
             .unwrap();
@@ -829,16 +923,15 @@ mod tests {
 
     #[test]
     fn wait_is_independent_of_tpb() {
-        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
         runtime
             .load_module(
                 0x44,
                 r#"
-                return { run = function(a1, a2, ctx)
-                    emit(0x90, a1, 100)
-                    wait(1)
-                    emit(0x91, a2, 100)
-                end }
+                (fn run [a1 a2 ctx]
+                  (emit 0x90 a1 100)
+                  (wait 1)
+                  (emit 0x91 a2 100))
                 "#,
             )
             .unwrap();
@@ -861,17 +954,16 @@ mod tests {
     }
 
     #[test]
-    fn stop_track_false_keeps_the_lua_caller_alive() {
-        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+    fn stop_track_false_keeps_the_macro_caller_alive() {
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
         runtime
             .load_module(
                 0x42,
                 r#"
-                return { run = function(a1, a2, ctx)
-                    stop_track(false)
-                    wait(2)
-                    emit(0x90, 99, 1)
-                end }
+                (fn run [a1 a2 ctx]
+                  (stop-track false)
+                  (wait 2)
+                  (emit 0x90 99 1))
                 "#,
             )
             .unwrap();
@@ -881,17 +973,16 @@ mod tests {
     }
 
     #[test]
-    fn stop_track_true_stops_the_lua_caller() {
-        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+    fn stop_track_true_stops_the_macro_caller() {
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
         runtime
             .load_module(
                 0x43,
                 r#"
-                return { run = function(a1, a2, ctx)
-                    stop_track(true)
-                    wait(2)
-                    emit(0x90, 99, 1)
-                end }
+                (fn run [a1 a2 ctx]
+                  (stop-track true)
+                  (wait 2)
+                  (emit 0x90 99 1))
                 "#,
             )
             .unwrap();
@@ -902,16 +993,14 @@ mod tests {
 
     #[test]
     fn math_random_is_deterministic_per_seed() {
-        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
         runtime
             .load_module(
                 0x7A,
                 r#"
-                return function(a1, a2, ctx)
-                    for _ = 1, 8 do
-                        emit(0x90, math.random(0, 127), 100)
-                    end
-                end
+                (fn run [a1 a2 ctx]
+                  (for [_ 1 8]
+                    (emit 0x90 (math.random 0 127) 100)))
                 "#,
             )
             .unwrap();
@@ -928,16 +1017,14 @@ mod tests {
 
     #[test]
     fn different_seeds_change_the_output() {
-        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
         runtime
             .load_module(
                 0x7B,
                 r#"
-                return function(a1, a2, ctx)
-                    for _ = 1, 8 do
-                        emit(0x90, math.random(0, 127), 100)
-                    end
-                end
+                (fn run [a1 a2 ctx]
+                  (for [_ 1 8]
+                    (emit 0x90 (math.random 0 127) 100)))
                 "#,
             )
             .unwrap();
@@ -952,18 +1039,16 @@ mod tests {
 
     #[test]
     fn random_generator_is_independent_of_the_global_series() {
-        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
         runtime
             .load_module(
                 0x7C,
                 r#"
-                return function(a1, a2, ctx)
-                    local rng = RandomGenerator(99)
-                    for _ = 1, 4 do
-                        emit(0x90, rng:next(0, 127), 100)
-                    end
-                    emit(0x91, rng(0, 127), 100)
-                end
+                (fn run [a1 a2 ctx]
+                  (let [rng (random-generator 99)]
+                    (for [_ 1 4]
+                      (emit 0x90 (rng:next 0 127) 100))
+                    (emit 0x91 (rng 0 127) 100)))
                 "#,
             )
             .unwrap();
@@ -976,23 +1061,25 @@ mod tests {
         let a = run(first, &runtime);
         let b = run(second, &runtime);
         assert_eq!(notes(&a).len(), 5);
-        assert_eq!(notes(&a), notes(&b), "RandomGenerator ignores the seed");
+        assert_eq!(
+            notes(&a),
+            notes(&b),
+            "random-generator ignores the global seed"
+        );
         assert!(a.diagnostics().is_empty());
     }
 
     #[test]
     fn random_generator_reproduces_across_renders() {
-        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
         runtime
             .load_module(
                 0x7D,
                 r#"
-                return function(a1, a2, ctx)
-                    local rng = RandomGenerator(1234)
-                    for _ = 1, 4 do
-                        emit(0x90, rng.next(0, 127), 100)
-                    end
-                end
+                (fn run [a1 a2 ctx]
+                  (let [rng (random-generator 1234)]
+                    (for [_ 1 4]
+                      (emit 0x90 (rng.next 0 127) 100))))
                 "#,
             )
             .unwrap();
@@ -1003,22 +1090,19 @@ mod tests {
 
     #[test]
     fn math_random_follows_lua_conventions() {
-        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
         runtime
             .load_module(
                 0x7E,
                 r#"
-                return function(a1, a2, ctx)
-                    if math.type(math.random()) ~= "float" then
-                        error("no-argument random should return a float")
-                    end
-                    if math.type(math.random(0)) ~= "integer" then
-                        error("zero-argument random should return an integer")
-                    end
-                    emit(0x90, math.random(5, 5), 100)
-                    emit(0x91, math.random(1), 100)
-                    emit(0x92, math.random(0, 0), 100)
-                end
+                (fn run [a1 a2 ctx]
+                  (when (not= (math.type (math.random)) :float)
+                    (error "no-argument random should return a float"))
+                  (when (not= (math.type (math.random 0)) :integer)
+                    (error "zero-argument random should return an integer"))
+                  (emit 0x90 (math.random 5 5) 100)
+                  (emit 0x91 (math.random 1) 100)
+                  (emit 0x92 (math.random 0 0) 100))
                 "#,
             )
             .unwrap();
@@ -1034,14 +1118,13 @@ mod tests {
 
     #[test]
     fn math_randomseed_is_refused() {
-        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
         runtime
             .load_module(
                 0x7F,
                 r#"
-                return function(a1, a2, ctx)
-                    math.randomseed(1)
-                end
+                (fn run [a1 a2 ctx]
+                  (math.randomseed 1))
                 "#,
             )
             .unwrap();
@@ -1058,9 +1141,9 @@ mod tests {
 
     #[test]
     fn setup_module_registers_commands() {
-        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
         runtime
-            .run_setup(r#"register_command("hello", "says hi")"#)
+            .run_setup(r#"(register-command :hello "says hi")"#)
             .unwrap();
         let commands = runtime.commands();
         assert_eq!(commands.len(), 1);
@@ -1070,12 +1153,9 @@ mod tests {
 
     #[test]
     fn macro_errors_are_isolated_and_reported() {
-        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
         runtime
-            .load_module(
-                0x44,
-                r#"return { run = function(a1, a2, ctx) error("boom") end }"#,
-            )
+            .load_module(0x44, r#"(fn run [a1 a2 ctx] (error "boom"))"#)
             .unwrap();
         let engine = run(pattern_with_macro(0x44, 0, 0), &runtime);
         assert!(engine.diagnostics().iter().any(|d| d.contains("boom")));
@@ -1084,16 +1164,13 @@ mod tests {
 
     #[test]
     fn runaway_macro_hits_the_instruction_budget() {
-        let limits = LuaLimits {
+        let limits = MacroLimits {
             instructions_per_tick: 20_000,
-            ..LuaLimits::default()
+            ..MacroLimits::default()
         };
-        let runtime = LuaRuntime::new(limits).unwrap();
+        let runtime = MacroRuntime::new(limits).unwrap();
         runtime
-            .load_module(
-                0x45,
-                r#"return { run = function(a1, a2, ctx) while true do end end }"#,
-            )
+            .load_module(0x45, r#"(fn run [a1 a2 ctx] (while true nil))"#)
             .unwrap();
         let engine = run(pattern_with_macro(0x45, 0, 0), &runtime);
         assert!(engine
@@ -1105,16 +1182,15 @@ mod tests {
 
     #[test]
     fn macros_can_read_and_write_settings() {
-        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
         runtime
             .load_module(
                 0x46,
                 r#"
-                return { run = function(a1, a2, ctx)
-                    local root = get_setting("root")
-                    set_setting("root", root + 2)
-                    emit(0x90, get_setting("root"), 1)
-                end }
+                (fn run [a1 a2 ctx]
+                  (let [root (get-setting :root)]
+                    (set-setting :root (+ root 2))
+                    (emit 0x90 (get-setting :root) 1)))
                 "#,
             )
             .unwrap();
@@ -1131,27 +1207,21 @@ mod tests {
 
     #[test]
     fn registering_commands_needs_setup() {
-        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
-        // A macro module has no `register_command`.
-        runtime
-            .load_module(
-                0x47,
-                r#"
-                return { run = function(a1, a2, ctx)
-                    if register_command == nil then
-                        emit(0x90, 1, 1)
-                    end
-                end }
-                "#,
-            )
-            .unwrap();
-        let engine = run(pattern_with_macro(0x47, 0, 0), &runtime);
-        assert_eq!(notes(&engine), vec![(0, 0, 1)]);
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
+        // A macro module may not reference the setup-only name at all.
+        let error = runtime
+            .load_module(0x47, "(fn run [a1 a2 ctx] (register-command :x))")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unknown identifier: register-command"),
+            "{error}"
+        );
     }
 
     #[test]
     fn builtin_trigger_and_tempo_modules_work() {
-        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
         // Build a parent with a built-in trigger to a child pattern.
         let mut composition = Composition::new();
         let child = composition.create_pattern(4).unwrap();
@@ -1185,14 +1255,14 @@ mod tests {
 
     #[test]
     fn require_loads_and_caches_modules_and_detects_cycles() {
-        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
-        runtime.set_module_source(0x50, "return { value = 7 }");
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
+        runtime.set_module_source(0x50, "{:value 7}");
         runtime
             .load_module(
                 0x51,
                 r#"
-                local util = require(0x50)
-                return { run = function(a1, a2, ctx) emit(0x90, util.value, 1) end }
+                (local util (require 0x50))
+                (fn run [a1 a2 ctx] (emit 0x90 util.value 1))
                 "#,
             )
             .unwrap();
@@ -1200,31 +1270,29 @@ mod tests {
         assert_eq!(notes(&engine), vec![(0, 0, 7)]);
 
         // Circular dependency is a deterministic diagnostic.
-        let cyclic = LuaRuntime::new(LuaLimits::default()).unwrap();
-        cyclic.set_module_source(0x52, "return require(0x53)");
-        cyclic.set_module_source(0x53, "return require(0x52)");
+        let cyclic = MacroRuntime::new(MacroLimits::default()).unwrap();
+        cyclic.set_module_source(0x52, "(require 0x53)");
+        cyclic.set_module_source(0x53, "(require 0x52)");
         let error = cyclic.validate().unwrap_err().to_string();
         assert!(error.contains("circular"), "{error}");
     }
 
     #[test]
     fn require_reports_unavailable_ids() {
-        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
-        runtime
-            .load_module(0x54, "return require(0x7E)")
-            .unwrap_err();
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
+        runtime.load_module(0x54, "(require 0x7E)").unwrap_err();
         // The error is raised during module evaluation, so load_module errors.
         assert!(!runtime.has_module(0x7E));
     }
 
     #[test]
     fn module_zero_setup_side_effects_run_once() {
-        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
         runtime
             .run_setup(
                 r#"
-                register_command("hello")
-                return { greeting = "hi" }
+                (register-command :hello)
+                {:greeting "hi"}
                 "#,
             )
             .unwrap();
@@ -1234,15 +1302,41 @@ mod tests {
     }
 
     #[test]
+    fn kebab_case_api_names_resolve_through_mangling() {
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
+        runtime
+            .load_module(
+                0x48,
+                r#"(fn run [a1 a2 ctx] (emit-sysex [0xF0 0x7D 0xF7]))"#,
+            )
+            .unwrap();
+        let engine = run(pattern_with_macro(0x48, 0, 0), &runtime);
+        assert!(engine.output().iter().any(|te| matches!(
+            &te.event,
+            Event::SysEx(data) if data == &vec![0xF0, 0x7D, 0xF7]
+        )));
+    }
+
+    #[test]
+    fn default_module_template_compiles_and_loads() {
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
+        runtime
+            .run_setup(mtrak_core::modules::MODULE_TEMPLATE)
+            .unwrap();
+        let value = runtime.module_value(0).expect("the template must cache");
+        assert!(matches!(value, Value::Table(_)));
+    }
+
+    #[test]
     fn require_returns_any_cached_value() {
-        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
-        runtime.set_module_source(0x55, "return 42");
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
+        runtime.set_module_source(0x55, "42");
         runtime
             .load_module(
                 0x56,
                 r#"
-                local n = require(0x55)
-                return { run = function(a1, a2, ctx) emit(0x90, n, 1) end }
+                (local n (require 0x55))
+                (fn run [a1 a2 ctx] (emit 0x90 n 1))
                 "#,
             )
             .unwrap();

@@ -1,4 +1,4 @@
-//! Lua module source map shared by the model, I/O, and TUI layers.
+//! Fennel module source map shared by the model, I/O, and TUI layers.
 //!
 //! Project storage keeps every authored module in one ID-keyed map: module
 //! `00` (the editable project/library module) plus the user modules in
@@ -10,16 +10,15 @@ use std::collections::BTreeMap;
 /// The minimal valid module template used for module `00` and for lazily
 /// created user modules. It exposes the required `run` entry point while
 /// returning a module table for `require`.
-pub const MODULE_TEMPLATE: &str =
-    "local M = {}\n\nfunction M.run(arg1, arg2, ctx)\nend\n\nreturn M\n";
+pub const MODULE_TEMPLATE: &str = "(local M {})\n\n(fn M.run [arg1 arg2 ctx]\n  nil)\n\nM\n";
 
 /// The embedded, read-only built-in module sources (`01`–`3F`), keyed by ID.
 ///
-/// The Lua sources live in `src/builtins/NN.lua` and are compiled into the
+/// The Fennel sources live in `src/builtins/NN.fnl` and are compiled into the
 /// executable. They are inspectable in the Code screen but never serialized.
 pub const BUILTIN_MODULES: &[(u8, &str)] = &[
-    (0x01, include_str!("builtins/01.lua")),
-    (0x02, include_str!("builtins/02.lua")),
+    (0x01, include_str!("builtins/01.fnl")),
+    (0x02, include_str!("builtins/02.fnl")),
 ];
 
 /// Looks up an embedded built-in module source.

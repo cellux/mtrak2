@@ -1,4 +1,4 @@
-//! Deterministic scheduler and sandboxed Lua macro runtime for mtrak.
+//! Deterministic scheduler and sandboxed Fennel macro runtime for mtrak.
 //!
 //! The engine advances a single global tick clock, maintains pattern instances
 //! with track-local child ownership, and emits timestamped events into a sink.
@@ -7,7 +7,8 @@
 
 #![forbid(unsafe_code)]
 
-pub mod lua;
+pub mod fennel;
 pub mod macros;
 pub mod rng;
+pub mod runtime;
 pub mod scheduler;

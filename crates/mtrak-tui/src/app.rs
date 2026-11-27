@@ -34,7 +34,7 @@ pub enum Screen {
     Browser,
     /// `F3` — the pattern grid.
     Pattern,
-    /// `F4` — the Lua code editor.
+    /// `F4` — the Fennel code editor.
     Code,
 }
 
@@ -115,10 +115,10 @@ struct PathCompletion {
     selected: usize,
 }
 
-/// A project command registered by the Lua setup module. It is TUI-only and is
+/// A project command registered by the setup module. It is TUI-only and is
 /// never serialized into an exported file.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct LuaCommand {
+pub struct ProjectCommand {
     /// The command name (without the leading colon).
     pub name: String,
     /// An optional description.
@@ -310,12 +310,12 @@ pub enum ChooserClipboard {
     },
 }
 
-/// Provides a fresh macro factory for rendering (e.g. a Lua runtime).
+/// Provides a fresh macro factory for rendering (e.g. a Fennel runtime).
 pub trait MacroSource {
     /// Builds a macro factory, or `None` when there are no macros.
     fn factory(&self) -> Option<Box<dyn MacroFactory>>;
     /// Rebuilds the runtime from `modules`, returning registered commands.
-    fn reload(&mut self, modules: &BTreeMap<u8, String>) -> Result<Vec<LuaCommand>, String>;
+    fn reload(&mut self, modules: &BTreeMap<u8, String>) -> Result<Vec<ProjectCommand>, String>;
 }
 
 /// The whole application state.
@@ -364,8 +364,8 @@ pub struct App {
     // External services.
     midi: Option<OutputManager<Box<dyn MidiBackend>>>,
     macro_source: Option<Box<dyn MacroSource>>,
-    lua_commands: Vec<LuaCommand>,
-    lua_dirty: bool,
+    project_commands: Vec<ProjectCommand>,
+    macros_dirty: bool,
 
     // Session.
     path: Option<PathBuf>,
@@ -428,8 +428,8 @@ impl App {
             browser: None,
             midi: None,
             macro_source: None,
-            lua_commands: Vec::new(),
-            lua_dirty: true,
+            project_commands: Vec::new(),
+            macros_dirty: true,
             path: None,
             quit: false,
             dirty: false,
@@ -537,13 +537,13 @@ impl App {
     }
 
     /// The commands registered by the project setup module.
-    pub fn lua_commands(&self) -> &[LuaCommand] {
-        &self.lua_commands
+    pub fn project_commands(&self) -> &[ProjectCommand] {
+        &self.project_commands
     }
 
-    /// Sets the project-defined Lua commands (TUI-only).
-    pub fn set_lua_commands(&mut self, commands: Vec<LuaCommand>) {
-        self.lua_commands = commands;
+    /// Sets the project-defined commands (TUI-only).
+    pub fn set_project_commands(&mut self, commands: Vec<ProjectCommand>) {
+        self.project_commands = commands;
     }
 
     /// Installs the MIDI output manager.
@@ -554,7 +554,7 @@ impl App {
     /// Installs the macro source used for rendering.
     pub fn set_macro_source(&mut self, source: Box<dyn MacroSource>) {
         self.macro_source = Some(source);
-        self.lua_dirty = true;
+        self.macros_dirty = true;
     }
 
     /// Sets the current file path.
@@ -895,7 +895,7 @@ impl App {
             Action::PatternScreen => return self.switch_screen(Screen::Pattern),
             Action::CodeScreen => return self.switch_screen(Screen::Code),
             Action::OpenChooser => return self.open_chooser(),
-            Action::ReloadLua => return self.reload_lua(),
+            Action::ReloadMacros => return self.reload_macros(),
             Action::Quit => {
                 // Quitting is a user-initiated stop: do not leave notes
                 // ringing behind us.
@@ -1113,7 +1113,7 @@ impl App {
             | Action::PatternScreen
             | Action::CodeScreen
             | Action::OpenChooser
-            | Action::ReloadLua
+            | Action::ReloadMacros
             | Action::Quit
             | Action::Save
             | Action::AllNotesOff => {}
@@ -2066,7 +2066,7 @@ impl App {
         if let Some(previous) = previous {
             self.code = CodeEditor::from_text(&previous);
             self.project.modules.insert(id, previous);
-            self.lua_dirty = true;
+            self.macros_dirty = true;
             self.dirty = true;
         }
     }
@@ -2081,7 +2081,7 @@ impl App {
         if let Some(next) = next {
             self.code = CodeEditor::from_text(&next);
             self.project.modules.insert(id, next);
-            self.lua_dirty = true;
+            self.macros_dirty = true;
             self.dirty = true;
         }
     }
@@ -2858,7 +2858,7 @@ impl App {
         self.project
             .modules
             .insert(self.module_id, self.code.text());
-        self.lua_dirty = true;
+        self.macros_dirty = true;
     }
 
     fn code_mutate(&mut self, mutate: impl FnOnce(&mut CodeEditor)) {
@@ -2872,40 +2872,40 @@ impl App {
         self.dirty = true;
     }
 
-    /// Validates and reloads the project Lua runtime.
-    pub fn reload_lua(&mut self) {
+    /// Validates and reloads the project macro runtime.
+    pub fn reload_macros(&mut self) {
         self.sync_module_text();
         match self.macro_source.as_mut() {
             Some(source) => match source.reload(&self.project.modules) {
                 Ok(commands) => {
-                    self.lua_commands = commands;
-                    self.lua_dirty = false;
-                    self.set_message("Lua runtime reloaded".to_string(), false);
+                    self.project_commands = commands;
+                    self.macros_dirty = false;
+                    self.set_message("macro runtime reloaded".to_string(), false);
                 }
                 Err(error) => {
-                    self.set_message(format!("Lua error: {error}"), true);
+                    self.set_message(format!("macro error: {error}"), true);
                 }
             },
             None => {
-                self.set_message("no Lua runtime is available".to_string(), true);
+                self.set_message("no macro runtime is available".to_string(), true);
             }
         }
     }
 
-    fn ensure_lua(&mut self) -> Result<(), String> {
-        if !self.lua_dirty {
+    fn ensure_macros(&mut self) -> Result<(), String> {
+        if !self.macros_dirty {
             return Ok(());
         }
         self.sync_module_text();
         match self.macro_source.as_mut() {
             Some(source) => {
                 let commands = source.reload(&self.project.modules)?;
-                self.lua_commands = commands;
-                self.lua_dirty = false;
+                self.project_commands = commands;
+                self.macros_dirty = false;
                 Ok(())
             }
             None => {
-                self.lua_dirty = false;
+                self.macros_dirty = false;
                 Ok(())
             }
         }
@@ -2927,7 +2927,7 @@ impl App {
     pub fn save(&mut self, path: Option<String>) -> Result<(), String> {
         let requested = self.resolve_path(path)?;
         let path = self.canonical_output_path(&requested)?;
-        self.ensure_lua()?;
+        self.ensure_macros()?;
         let factory = self.macro_source.as_ref().and_then(|s| s.factory());
         let bytes =
             mtrak_midi_io::smf::save_project(&self.project, factory).map_err(|e| e.to_string())?;
@@ -2965,7 +2965,7 @@ impl App {
     /// Exports standard MIDI.
     pub fn export(&mut self, path: Option<String>) -> Result<(), String> {
         let path = self.resolve_path(path)?;
-        self.ensure_lua()?;
+        self.ensure_macros()?;
         let factory = self.macro_source.as_ref().and_then(|s| s.factory());
         let bytes = mtrak_midi_io::smf::export_standard(&self.project.composition, factory)
             .map_err(|e| e.to_string())?;
@@ -3002,11 +3002,11 @@ impl App {
         self.path = Some(path.clone());
         self.dirty = false;
         self.project_revision += 1;
-        self.lua_dirty = true;
-        self.lua_commands.clear();
+        self.macros_dirty = true;
+        self.project_commands.clear();
         self.edit = None;
         self.screen = Screen::Pattern;
-        let _ = self.ensure_lua();
+        let _ = self.ensure_macros();
         self.set_message(
             format!(
                 "loaded {} ({})",
@@ -3041,7 +3041,7 @@ impl App {
 
     /// Starts playback from the configured start row.
     pub fn start_playback(&mut self) {
-        if self.ensure_lua().is_err() {
+        if self.ensure_macros().is_err() {
             return;
         }
         let events = self.render();
@@ -3401,7 +3401,7 @@ impl App {
             Code::Char('y') if key.ctrl => self.redo_module(),
             Code::Char('s') if key.ctrl => self.apply(Action::Save),
             Code::Enter if key.alt => self.open_chooser(),
-            Code::Function(5) => self.reload_lua(),
+            Code::Function(5) => self.reload_macros(),
             Code::Left => self.code.move_left(),
             Code::Right => self.code.move_right(),
             Code::Up => self.code.move_up(),
@@ -4700,7 +4700,7 @@ mod tests {
         }
         app.handle_key(Key::new(Code::Enter));
         assert_eq!(app.module_id(), 0x40);
-        assert!(app.module_source(0x40).unwrap().contains("function M.run"));
+        assert!(app.module_source(0x40).unwrap().contains("(fn M.run"));
         app.handle_key(Key::ch('X'));
         assert!(app.project().modules.get(&0x40).unwrap().contains('X'));
         app.handle_key(Key::ctrl(Code::Char('z')));

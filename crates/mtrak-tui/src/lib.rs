@@ -24,8 +24,8 @@ pub mod undo;
 mod test_support;
 
 pub use app::{
-    App, BrushHeight, BrushWidth, ChooserClipboard, LuaCommand, MacroSource, Message, Mode, Rect,
-    Screen, Selection,
+    App, BrushHeight, BrushWidth, ChooserClipboard, MacroSource, Message, Mode, ProjectCommand,
+    Rect, Screen, Selection,
 };
 pub use browser::{Browser, Entry, EntryKind};
 pub use command::{parse as parse_command, Command};

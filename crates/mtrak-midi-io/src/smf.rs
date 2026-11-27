@@ -799,8 +799,7 @@ mod tests {
 
     #[test]
     fn render_is_deterministic_for_a_fixed_seed() {
-        use mtrak_engine::lua::LuaMacroFactory;
-        use mtrak_engine::lua::{LuaLimits, LuaRuntime};
+        use mtrak_engine::runtime::{MacroLimits, MacroRuntime, RuntimeMacroFactory};
 
         let mut composition = Composition::new();
         composition.set_seed(4242);
@@ -809,22 +808,20 @@ mod tests {
             pattern.resize_rows(4).unwrap();
             pattern.set_event(0, 0, Event::Macro(MacroCall::new(0x40, 0, 0)));
         }
-        let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+        let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
         runtime
             .load_module(
                 0x40,
                 r#"
-                return { run = function(a1, a2, ctx)
-                    for _ = 1, 6 do
-                        emit(0x90, math.random(0, 127), 100)
-                    end
-                end }
+                (fn run [a1 a2 ctx]
+                  (for [_ 1 6]
+                    (emit 0x90 (math.random 0 127) 100)))
                 "#,
             )
             .unwrap();
 
         let render = |composition: &Composition| {
-            let factory = Box::new(LuaMacroFactory::new(runtime.clone()));
+            let factory = Box::new(RuntimeMacroFactory::new(runtime.clone()));
             render_events(composition, Some(factory))
         };
 

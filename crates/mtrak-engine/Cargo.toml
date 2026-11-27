@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Deterministic scheduler and sandboxed Lua macro runtime for mtrak."
+description = "Deterministic scheduler and sandboxed Fennel macro runtime for mtrak."
 
 [dependencies]
 mtrak-core.workspace = true

@@ -589,7 +589,7 @@ fn cursor_spans(spans: &[Span<'static>], cursor_col: usize) -> Vec<Span<'static>
 fn token_style(kind: TokenKind) -> Style {
     match kind {
         TokenKind::Keyword => Style::default().fg(Color::Magenta),
-        TokenKind::Function => Style::default().fg(Color::Cyan),
+        TokenKind::Symbol => Style::default().fg(Color::Cyan),
         TokenKind::Number => Style::default().fg(Color::Yellow),
         TokenKind::String => Style::default().fg(Color::Green),
         TokenKind::Comment => Style::default().fg(Color::DarkGray),
@@ -1309,14 +1309,14 @@ mod tests {
             terminal.backend().buffer().clone()
         };
 
-        // On the `local M = {}` line the cursor sits on `l` and the rest of
-        // the line keeps its keyword color.
+        // On the `(local M {})` line the cursor sits on `(` and the rest of
+        // the line keeps its syntax colors.
         let buffer = render(&mut terminal, &app);
         let cursor = cells_with_bg(&buffer, Color::Blue);
         assert_eq!(cursor.len(), 1, "exactly one cursor cell");
         let (x, y) = cursor[0];
-        assert_eq!(buffer[(x, y)].symbol(), "l");
-        assert_eq!(buffer[(x + 1, y)].symbol(), "o");
+        assert_eq!(buffer[(x, y)].symbol(), "(");
+        assert_eq!(buffer[(x + 1, y)].symbol(), "l");
         assert_eq!(
             buffer[(x + 1, y)].fg,
             Color::Magenta,

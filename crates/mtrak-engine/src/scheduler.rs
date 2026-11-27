@@ -11,7 +11,7 @@ use mtrak_core::event::{macro_id, Event, MacroCall, MetaEvent};
 use mtrak_core::settings::{Scale, Settings};
 use mtrak_core::timing::{row_ticks, TempoMap, Ticks};
 
-use crate::lua::{LuaLimits, LuaRuntime};
+use crate::runtime::{MacroLimits, MacroRuntime};
 
 use crate::macros::{Macro, MacroAction, MacroCtx, MacroFactory, SettingChange};
 
@@ -104,7 +104,7 @@ pub struct Engine {
     instances: Vec<Instance>,
     macros: Vec<MacroInstance>,
     factory: Option<Box<dyn MacroFactory>>,
-    builtins: Option<LuaRuntime>,
+    builtins: Option<MacroRuntime>,
     sink: Option<Box<dyn Sink>>,
     output: Vec<TimedEvent>,
     diagnostics: Vec<String>,
@@ -354,18 +354,18 @@ impl Engine {
         }
     }
 
-    /// Creates a built-in macro from the engine's own Lua runtime.
+    /// Creates a built-in macro from the engine's own Fennel runtime.
     ///
-    /// Built-in macros (`01`, `02`) are Lua modules only. This runtime is used
-    /// when the caller did not install a factory that already provides them; it
-    /// keeps the engine's built-in behavior in one implementation.
+    /// Built-in macros (`01`, `02`) are Fennel modules only. This runtime is
+    /// used when the caller did not install a factory that already provides
+    /// them; it keeps the engine's built-in behavior in one implementation.
     fn builtin_macro(&mut self, instance: u64, track: usize, call: MacroCall) {
         if self.builtins.is_none() {
-            match LuaRuntime::new(LuaLimits::default()) {
+            match MacroRuntime::new(MacroLimits::default()) {
                 Ok(runtime) => self.builtins = Some(runtime),
                 Err(error) => {
                     self.diagnostics.push(format!(
-                        "could not create the built-in Lua runtime: {error}"
+                        "could not create the built-in macro runtime: {error}"
                     ));
                     return;
                 }

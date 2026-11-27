@@ -29,14 +29,14 @@ const TAG_COMPOSITION: u8 = 0x01;
 const TAG_GLOBAL_SETTINGS: u8 = 0x02;
 const TAG_SCALES: u8 = 0x03;
 const TAG_PATTERNS: u8 = 0x04;
-const TAG_LUA: u8 = 0x05;
+const TAG_MODULES: u8 = 0x05;
 
-/// A tracker project: the composition plus its Lua module sources.
+/// A tracker project: the composition plus its Fennel macro module sources.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrackerProject {
     /// The composition itself.
     pub composition: Composition,
-    /// Authored Lua modules keyed by ID: module `00` plus user modules
+    /// Authored Fennel macro modules keyed by ID: module `00` plus user modules
     /// (`40`–`7F`). Built-in modules (`01`–`3F`) are not stored here.
     pub modules: BTreeMap<u8, String>,
 }
@@ -213,7 +213,7 @@ pub fn encode_project(project: &TrackerProject) -> Vec<u8> {
             write_pattern(w, pattern);
         }
     });
-    section(&mut w, TAG_LUA, |w| {
+    section(&mut w, TAG_MODULES, |w| {
         w.u16(project.modules.len() as u16);
         for (id, source) in &project.modules {
             w.u8(*id);
@@ -268,12 +268,12 @@ pub fn decode_project(blob: &[u8]) -> Result<TrackerProject, MetadataError> {
                     patterns.push(read_pattern(&mut s)?);
                 }
             }
-            TAG_LUA => {
+            TAG_MODULES => {
                 let count = s.u16()? as usize;
                 for _ in 0..count {
                     let id = s.u8()?;
                     let source = String::from_utf8(s.blob()?.to_vec())
-                        .map_err(|_| MetadataError::Invalid("lua source".to_string()))?;
+                        .map_err(|_| MetadataError::Invalid("module source".to_string()))?;
                     modules.insert(id, source);
                 }
             }
@@ -609,8 +609,8 @@ mod tests {
             .scales_mut()
             .add("weird", Scale::parse_mask("101001010100").unwrap());
         let mut modules = default_modules();
-        modules.insert(0x40, "return { run = function() end }".to_string());
-        modules.insert(0, "register_command('x')".to_string());
+        modules.insert(0x40, "(fn run [a1 a2 ctx] nil)".to_string());
+        modules.insert(0, "(register-command :x)".to_string());
         TrackerProject {
             composition,
             modules,

@@ -182,8 +182,8 @@ pub enum Action {
     CodeScreen,
     /// Open the pattern/module chooser.
     OpenChooser,
-    /// Validate/reload the project Lua runtime.
-    ReloadLua,
+    /// Validate/reload the project macro runtime.
+    ReloadMacros,
     /// Cut the selection.
     Cut,
     /// Copy the selection.
@@ -285,7 +285,7 @@ pub fn lookup(key: Key) -> Option<Action> {
         (Function(2), false, _) => A::FileBrowserScreen,
         (Function(3), false, _) => A::PatternScreen,
         (Function(4), false, _) => A::CodeScreen,
-        (Function(5), false, _) => A::ReloadLua,
+        (Function(5), false, _) => A::ReloadMacros,
         (Function(7), false, _) => A::TransposeDown,
         (Function(8), false, _) => A::TransposeUp,
         _ => return None,

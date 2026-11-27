@@ -155,7 +155,7 @@ fn integer(value: &Value) -> mlua::Result<i64> {
     }
 }
 
-/// Installs `math.random` and `RandomGenerator` into a module environment.
+/// Installs `math.random` and `random-generator` into a module environment.
 ///
 /// The stock `math` table is copied so the sandbox never mutates the privileged
 /// state, and its random entries are replaced: `math.random` draws from the
@@ -186,12 +186,14 @@ pub fn install(lua: &Lua, env: &mlua::Table, global: Rc<RefCell<SplitMix64>>) ->
     )?;
     env.set("math", curated)?;
 
+    let constructor = lua.create_function(|lua, seed: Value| {
+        let seed = integer(&seed)? as u64;
+        lua.create_userdata(RandomGenerator::new(seed))
+    })?;
+    env.set("random-generator", constructor.clone())?;
     env.set(
-        "RandomGenerator",
-        lua.create_function(|lua, seed: Value| {
-            let seed = integer(&seed)? as u64;
-            lua.create_userdata(RandomGenerator::new(seed))
-        })?,
+        crate::fennel::fennel_global_name("random-generator"),
+        constructor,
     )?;
     Ok(())
 }

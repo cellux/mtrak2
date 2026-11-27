@@ -70,8 +70,8 @@ fn build_app(path: Option<String>) -> Result<App, String> {
     }
     app.set_midi(manager);
 
-    if let Some((source, commands)) = lua_support::LuaSource::build(app.project()) {
-        app.set_lua_commands(commands);
+    if let Some((source, commands)) = macro_support::MacroRuntimeSource::build(app.project()) {
+        app.set_project_commands(commands);
         app.set_macro_source(Box::new(source));
     }
 
@@ -91,39 +91,44 @@ fn make_backend() -> Box<dyn MidiBackend> {
     Box::new(mtrak_midi::MockBackend::new(&[]))
 }
 
-mod lua_support {
+mod macro_support {
     use std::collections::BTreeMap;
 
     use mtrak_core::modules::SETUP;
-    use mtrak_engine::lua::{LuaLimits, LuaMacroFactory, LuaRuntime};
     use mtrak_engine::macros::MacroFactory;
+    use mtrak_engine::runtime::{MacroLimits, MacroRuntime, RuntimeMacroFactory};
     use mtrak_midi_io::TrackerProject;
-    use mtrak_tui::{LuaCommand, MacroSource};
+    use mtrak_tui::{MacroSource, ProjectCommand};
 
-    /// A macro source that renders user macros through a Lua runtime.
-    pub struct LuaSource {
-        runtime: LuaRuntime,
+    /// A macro source that renders user macros through a Fennel runtime.
+    pub struct MacroRuntimeSource {
+        runtime: MacroRuntime,
     }
 
-    impl LuaSource {
-        /// Builds a runtime from the project's Lua sources, returning the source
-        /// and the project-defined commands it registered.
-        pub fn build(project: &TrackerProject) -> Option<(LuaSource, Vec<LuaCommand>)> {
-            let mut source = LuaSource {
-                runtime: LuaRuntime::new(LuaLimits::default()).ok()?,
+    impl MacroRuntimeSource {
+        /// Builds a runtime from the project's macro sources, returning the
+        /// source and the project-defined commands it registered.
+        pub fn build(
+            project: &TrackerProject,
+        ) -> Option<(MacroRuntimeSource, Vec<ProjectCommand>)> {
+            let mut source = MacroRuntimeSource {
+                runtime: MacroRuntime::new(MacroLimits::default()).ok()?,
             };
             let commands = source.reload(&project.modules).ok()?;
             Some((source, commands))
         }
     }
 
-    impl MacroSource for LuaSource {
+    impl MacroSource for MacroRuntimeSource {
         fn factory(&self) -> Option<Box<dyn MacroFactory>> {
-            Some(Box::new(LuaMacroFactory::new(self.runtime.clone())))
+            Some(Box::new(RuntimeMacroFactory::new(self.runtime.clone())))
         }
 
-        fn reload(&mut self, modules: &BTreeMap<u8, String>) -> Result<Vec<LuaCommand>, String> {
-            let runtime = LuaRuntime::new(LuaLimits::default()).map_err(|e| e.to_string())?;
+        fn reload(
+            &mut self,
+            modules: &BTreeMap<u8, String>,
+        ) -> Result<Vec<ProjectCommand>, String> {
+            let runtime = MacroRuntime::new(MacroLimits::default()).map_err(|e| e.to_string())?;
             if let Some(source) = modules.get(&SETUP) {
                 runtime.run_setup(source).map_err(|e| e.to_string())?;
             }
@@ -136,7 +141,7 @@ mod lua_support {
             let commands = runtime
                 .commands()
                 .into_iter()
-                .map(|command| LuaCommand {
+                .map(|command| ProjectCommand {
                     name: command.name,
                     description: command.description,
                 })

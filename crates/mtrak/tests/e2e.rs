@@ -7,7 +7,7 @@
 use mtrak_core::composition::{Composition, PatternId};
 use mtrak_core::event::{macro_id, ChannelKind, ChannelMessage, Event, MacroCall, MetaEvent};
 use mtrak_core::timing::Bpm;
-use mtrak_engine::lua::{LuaLimits, LuaMacroFactory, LuaRuntime};
+use mtrak_engine::runtime::{MacroLimits, MacroRuntime, RuntimeMacroFactory};
 use mtrak_engine::scheduler::TimedEvent;
 use mtrak_midi_io::metadata::TrackerProject;
 use mtrak_midi_io::smf;
@@ -162,10 +162,10 @@ fn project_round_trip_keeps_metadata_without_duplicating_the_fallback() {
     }
     project
         .modules
-        .insert(0x41, "return { run = function() end }".to_string());
+        .insert(0x41, "(fn run [a1 a2 ctx] nil)".to_string());
     project
         .modules
-        .insert(0, "register_command('x')".to_string());
+        .insert(0, "(register-command :x)".to_string());
 
     let bytes = smf::save_project(&project, None).unwrap();
     assert!(
@@ -191,22 +191,19 @@ fn project_round_trip_keeps_metadata_without_duplicating_the_fallback() {
     );
     assert_eq!(
         loaded.project.modules.get(&0x41).map(String::as_str),
-        Some("return { run = function() end }")
+        Some("(fn run [a1 a2 ctx] nil)")
     );
     assert_eq!(
         loaded.project.modules.get(&0).map(String::as_str),
-        Some("register_command('x')")
+        Some("(register-command :x)")
     );
 }
 
 #[test]
-fn standard_export_renders_lua_macros_and_needs_no_metadata() {
-    let runtime = LuaRuntime::new(LuaLimits::default()).unwrap();
+fn standard_export_renders_macros_and_needs_no_metadata() {
+    let runtime = MacroRuntime::new(MacroLimits::default()).unwrap();
     runtime
-        .load_module(
-            0x41,
-            r#"return { run = function(a1, a2, ctx) emit(0x90, a1, 100) end }"#,
-        )
+        .load_module(0x41, r#"(fn run [a1 a2 ctx] (emit 0x90 a1 100))"#)
         .unwrap();
 
     let mut project = project_with(4, 1);
@@ -216,7 +213,7 @@ fn standard_export_renders_lua_macros_and_needs_no_metadata() {
         .unwrap()
         .set_event(0, 0, Event::Macro(MacroCall::new(0x41, 77, 0)));
 
-    let factory = Box::new(LuaMacroFactory::new(runtime.clone()));
+    let factory = Box::new(RuntimeMacroFactory::new(runtime.clone()));
     let bytes = smf::export_standard(&project.composition, Some(factory)).unwrap();
     assert!(
         !bytes.windows(5).any(|w| w == b"MTRAK"),
@@ -262,18 +259,15 @@ fn export_import_export_preserves_playback() {
 #[test]
 fn sandbox_has_no_host_access_and_runaways_are_bounded() {
     // A module that would only emit if a forbidden global were visible.
-    let sandboxed = LuaRuntime::new(LuaLimits::default()).unwrap();
+    let sandboxed = MacroRuntime::new(MacroLimits::default()).unwrap();
     sandboxed
         .load_module(
             0x41,
             r#"
-            return { run = function(a1, a2, ctx)
-                if os ~= nil or io ~= nil or debug ~= nil or package ~= nil then
-                    emit(0x90, 1, 1)
-                else
-                    emit(0x90, 60, 1)
-                end
-            end }
+            (fn run [a1 a2 ctx]
+              (if (or (. _ENV :os) (. _ENV :io) (. _ENV :debug) (. _ENV :package))
+                  (emit 0x90 1 1)
+                  (emit 0x90 60 1)))
             "#,
         )
         .unwrap();
@@ -284,20 +278,20 @@ fn sandbox_has_no_host_access_and_runaways_are_bounded() {
         .pattern_mut(PatternId(0))
         .unwrap()
         .set_event(0, 0, Event::Macro(MacroCall::new(0x41, 0, 0)));
-    let factory = Box::new(LuaMacroFactory::new(sandboxed.clone()));
+    let factory = Box::new(RuntimeMacroFactory::new(sandboxed.clone()));
     assert_eq!(
         notes(&smf::render_events(&project.composition, Some(factory))),
         vec![(0, 60)]
     );
 
     // A runaway macro must terminate rather than hang the renderer.
-    let limited = LuaRuntime::new(LuaLimits {
+    let limited = MacroRuntime::new(MacroLimits {
         instructions_per_tick: 20_000,
-        ..LuaLimits::default()
+        ..MacroLimits::default()
     })
     .unwrap();
     limited
-        .load_module(0x42, "return { run = function() while true do end end }")
+        .load_module(0x42, "(fn run [a1 a2 ctx] (while true nil))")
         .unwrap();
     let mut runaway = project_with(2, 1);
     runaway
@@ -305,7 +299,7 @@ fn sandbox_has_no_host_access_and_runaways_are_bounded() {
         .pattern_mut(PatternId(0))
         .unwrap()
         .set_event(0, 0, Event::Macro(MacroCall::new(0x42, 0, 0)));
-    let factory = Box::new(LuaMacroFactory::new(limited));
+    let factory = Box::new(RuntimeMacroFactory::new(limited));
     let events = smf::render_events(&runaway.composition, Some(factory));
     assert!(notes(&events).is_empty());
 }

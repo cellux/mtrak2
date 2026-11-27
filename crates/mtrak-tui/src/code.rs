@@ -1,24 +1,26 @@
-//! The Code screen: a multiline Lua text editor and a simple lexical
+//! The Code screen: a multiline Fennel text editor and a simple lexical
 //! highlighter.
 //!
 //! Editing is intentionally small and deterministic so it can be unit-tested
 //! without a terminal. The highlighter covers practical lexical categories
-//! only (keywords, function names, numbers, strings, comments, punctuation).
+//! only (special forms/macros, symbols, numbers, strings, comments, and
+//! delimiters). Compilation remains the authoritative validation of source
+//! correctness; highlighting is presentation only.
 
 /// A lexical category produced by the highlighter.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TokenKind {
-    /// A Lua keyword such as `local` or `function`.
+    /// A Fennel special form or built-in macro such as `fn` or `let`.
     Keyword,
-    /// A function name following `function` or a `name(` call.
-    Function,
+    /// An identifier or symbol.
+    Symbol,
     /// A numeric literal.
     Number,
-    /// A string literal.
+    /// A string literal (including `:keyword` strings).
     String,
     /// A comment.
     Comment,
-    /// Punctuation.
+    /// Punctuation or a delimiter.
     Punctuation,
 }
 
@@ -33,12 +35,64 @@ pub struct Span {
     pub kind: TokenKind,
 }
 
+/// Fennel special forms and built-in macros worth highlighting distinctly.
 const KEYWORDS: &[&str] = &[
-    "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if", "in",
-    "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
+    "and",
+    "band",
+    "bnot",
+    "bor",
+    "bxor",
+    "case",
+    "case-try",
+    "catch",
+    "collect",
+    "comment",
+    "do",
+    "doto",
+    "each",
+    "faccumulate",
+    "fcollect",
+    "fn",
+    "for",
+    "global",
+    "icollect",
+    "if",
+    "import-macros",
+    "include",
+    "lambda",
+    "let",
+    "local",
+    "lshift",
+    "macro",
+    "macros",
+    "match",
+    "match-try",
+    "nil",
+    "not",
+    "or",
+    "pick-args",
+    "require",
+    "require-macros",
+    "rshift",
+    "set",
+    "true",
+    "false",
+    "unless",
+    "values",
+    "var",
+    "when",
+    "where",
+    "while",
+    "with-open",
+    "->",
+    "->>",
+    "?.",
+    "?->",
+    "?->>",
+    "\u{3bb}",
 ];
 
-/// A multiline Lua editor with a character cursor.
+/// A multiline Fennel editor with a character cursor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodeEditor {
     lines: Vec<Vec<char>>,
@@ -184,7 +238,41 @@ impl CodeEditor {
     }
 }
 
-/// Highlights one line of Lua into spans.
+/// Whether `ch` may appear inside a Fennel symbol (or keyword) token.
+///
+/// Fennel symbols are far more permissive than Lua identifiers: they may
+/// contain `-`, `?`, `!`, `*`, `+`, `/`, `<`, `>`, `=`, `&`, `|`, `.`, `:`,
+/// and `#`. Recognizing the whole run keeps highlighting stable while typing.
+fn is_symbol_char(ch: char) -> bool {
+    ch.is_alphanumeric()
+        || matches!(
+            ch,
+            '_' | '-'
+                | '?'
+                | '!'
+                | '*'
+                | '+'
+                | '/'
+                | '<'
+                | '>'
+                | '='
+                | '&'
+                | '|'
+                | '.'
+                | ':'
+                | '#'
+                | '$'
+                | '%'
+                | '@'
+        )
+}
+
+/// Whether `ch` can begin a Fennel symbol token.
+fn is_symbol_start(ch: char) -> bool {
+    is_symbol_char(ch) && !ch.is_ascii_digit()
+}
+
+/// Highlights one line of Fennel into spans.
 pub fn highlight(line: &[char]) -> Vec<Span> {
     let mut spans = Vec::new();
     let mut i = 0;
@@ -195,8 +283,8 @@ pub fn highlight(line: &[char]) -> Vec<Span> {
             i += 1;
             continue;
         }
-        // Comments.
-        if ch == '-' && line.get(i + 1) == Some(&'-') {
+        // Comments run to the end of the line.
+        if ch == ';' {
             spans.push(Span {
                 start: i,
                 end: n,
@@ -205,8 +293,7 @@ pub fn highlight(line: &[char]) -> Vec<Span> {
             break;
         }
         // Strings.
-        if ch == '"' || ch == '\'' {
-            let quote = ch;
+        if ch == '"' {
             let start = i;
             i += 1;
             while i < n {
@@ -214,7 +301,7 @@ pub fn highlight(line: &[char]) -> Vec<Span> {
                     i += 2;
                     continue;
                 }
-                if line[i] == quote {
+                if line[i] == '"' {
                     i += 1;
                     break;
                 }
@@ -227,10 +314,19 @@ pub fn highlight(line: &[char]) -> Vec<Span> {
             });
             continue;
         }
-        // Numbers.
-        if ch.is_ascii_digit() {
+        // Numbers (including hex, floats, and a leading sign).
+        let signed = (ch == '-' || ch == '+') && line.get(i + 1).is_some_and(char::is_ascii_digit);
+        if ch.is_ascii_digit() || signed {
             let start = i;
-            while i < n && (line[i].is_ascii_alphanumeric() || line[i] == '.') {
+            if signed {
+                i += 1;
+            }
+            while i < n
+                && (line[i].is_ascii_alphanumeric()
+                    || line[i] == '.'
+                    || line[i] == '_'
+                    || ((line[i] == '+' || line[i] == '-') && matches!(line[i - 1], 'e' | 'E')))
+            {
                 i += 1;
             }
             spans.push(Span {
@@ -240,19 +336,31 @@ pub fn highlight(line: &[char]) -> Vec<Span> {
             });
             continue;
         }
-        // Identifiers and keywords.
-        if ch.is_alphabetic() || ch == '_' {
+        // Keyword strings such as `:root`.
+        if ch == ':' && line.get(i + 1).is_some_and(|c| is_symbol_start(*c)) {
             let start = i;
-            while i < n && (line[i].is_alphanumeric() || line[i] == '_') {
+            i += 1;
+            while i < n && is_symbol_char(line[i]) {
+                i += 1;
+            }
+            spans.push(Span {
+                start,
+                end: i,
+                kind: TokenKind::String,
+            });
+            continue;
+        }
+        // Symbols, special forms, and built-in macros.
+        if is_symbol_start(ch) {
+            let start = i;
+            while i < n && is_symbol_char(line[i]) {
                 i += 1;
             }
             let word: String = line[start..i].iter().collect();
             let kind = if KEYWORDS.contains(&word.as_str()) {
                 TokenKind::Keyword
-            } else if is_function_name(line, i) {
-                TokenKind::Function
             } else {
-                continue;
+                TokenKind::Symbol
             };
             spans.push(Span {
                 start,
@@ -261,7 +369,7 @@ pub fn highlight(line: &[char]) -> Vec<Span> {
             });
             continue;
         }
-        // Punctuation.
+        // Delimiters and other punctuation.
         let start = i;
         i += 1;
         spans.push(Span {
@@ -271,14 +379,6 @@ pub fn highlight(line: &[char]) -> Vec<Span> {
         });
     }
     spans
-}
-
-fn is_function_name(line: &[char], end: usize) -> bool {
-    let mut i = end;
-    while i < line.len() && line[i].is_whitespace() {
-        i += 1;
-    }
-    line.get(i) == Some(&'(')
 }
 
 #[cfg(test)]
@@ -291,20 +391,20 @@ mod tests {
 
     #[test]
     fn typing_and_navigation_edit_the_text() {
-        let mut editor = CodeEditor::from_text("local M = {}");
+        let mut editor = CodeEditor::from_text("(local M {})");
         editor.move_end();
         editor.insert(';');
-        assert_eq!(text_of(&editor), "local M = {};");
+        assert_eq!(text_of(&editor), "(local M {});");
         editor.newline();
         editor.insert('x');
-        assert_eq!(text_of(&editor), "local M = {};\nx");
+        assert_eq!(text_of(&editor), "(local M {});\nx");
         editor.backspace();
         editor.backspace();
-        assert_eq!(text_of(&editor), "local M = {};");
+        assert_eq!(text_of(&editor), "(local M {});");
         editor.move_up();
         editor.move_end();
         editor.delete();
-        assert_eq!(text_of(&editor), "local M = {};");
+        assert_eq!(text_of(&editor), "(local M {});");
     }
 
     #[test]
@@ -317,20 +417,25 @@ mod tests {
 
     #[test]
     fn highlighting_covers_practical_categories() {
-        let line: Vec<char> = "local x = 12 -- note".chars().collect();
+        let line: Vec<char> = "(fn run [a1] ; note".chars().collect();
         let spans = highlight(&line);
         assert!(spans.iter().any(|s| s.kind == TokenKind::Keyword));
-        assert!(spans.iter().any(|s| s.kind == TokenKind::Number));
+        assert!(spans.iter().any(|s| s.kind == TokenKind::Symbol));
         assert!(spans.iter().any(|s| s.kind == TokenKind::Comment));
-        let line: Vec<char> = "function M.run(a) return \"hi\" end".chars().collect();
+        assert!(spans.iter().any(|s| s.kind == TokenKind::Punctuation));
+
+        let line: Vec<char> = "(get-setting :root 0x2A 1.5)".chars().collect();
         let spans = highlight(&line);
-        assert!(spans.iter().any(|s| s.kind == TokenKind::Function));
         assert!(spans.iter().any(|s| s.kind == TokenKind::String));
+        assert_eq!(
+            spans.iter().filter(|s| s.kind == TokenKind::Number).count(),
+            2
+        );
     }
 
     #[test]
     fn highlight_spans_are_in_bounds_and_ordered() {
-        let line: Vec<char> = "local t = { a = 1 }".chars().collect();
+        let line: Vec<char> = "(let [x 1] (+ x 2))".chars().collect();
         let spans = highlight(&line);
         let mut last = 0;
         for span in spans {
@@ -339,5 +444,17 @@ mod tests {
             assert!(span.start >= last);
             last = span.end;
         }
+    }
+
+    #[test]
+    fn kebab_case_symbols_stay_one_token() {
+        let line: Vec<char> = "(emit-sysex [1 2])".chars().collect();
+        let spans = highlight(&line);
+        let symbol = spans
+            .iter()
+            .find(|s| s.kind == TokenKind::Symbol)
+            .expect("a symbol span");
+        let text: String = line[symbol.start..symbol.end].iter().collect();
+        assert_eq!(text, "emit-sysex");
     }
 }

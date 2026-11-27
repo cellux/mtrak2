@@ -6,7 +6,7 @@ CARGO ?= cargo
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build release test fmt fmt-check clippy verify run clean
+.PHONY: help build release test fmt fmt-check clippy verify run clean update-fennel
 
 help: ## Show this help message
 	@echo "mtrak make targets:"
@@ -38,6 +38,9 @@ verify: fmt-check clippy test ## Run the full local verification gate
 
 run: ## Run the app, e.g. `make run ARGS=project.mid`
 	$(CARGO) run -p mtrak -- $(ARGS)
+
+update-fennel: ## Replace the checked-in Fennel compiler (FENNEL_VERSION required)
+	@FENNEL_VERSION='$(FENNEL_VERSION)' sh scripts/update-fennel.sh
 
 clean: ## Remove build artifacts
 	$(CARGO) clean
