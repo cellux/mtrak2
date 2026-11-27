@@ -190,6 +190,22 @@ fn channel_event(
     event_to_lua(lua, &Event::Channel(message))
 }
 
+/// The event type names accepted by `:type`.
+pub const EVENT_TYPES: &[&str] = &[
+    "empty", "channel", "macro", "sysex", "meta", "escape", "wire",
+];
+
+/// The channel message names accepted by `:kind`.
+pub const CHANNEL_KINDS: &[&str] = &[
+    "note-off",
+    "note-on",
+    "poly-aftertouch",
+    "control-change",
+    "program-change",
+    "channel-aftertouch",
+    "pitch-bend",
+];
+
 /// Installs the `mtrak.events` constructors.
 pub fn install_events(lua: &Lua, mtrak: &Table) -> mlua::Result<()> {
     let events = lua.create_table()?;
@@ -246,6 +262,26 @@ pub fn install_events(lua: &Lua, mtrak: &Table) -> mlua::Result<()> {
         "macro",
         lua.create_function(|lua, (id, arg1, arg2): (u8, u8, u8)| {
             event_to_lua(lua, &Event::Macro(MacroCall { id, arg1, arg2 }))
+        })?,
+    )?;
+    events.set(
+        "kinds",
+        lua.create_function(|lua, ()| {
+            let kinds = lua.create_table()?;
+            for (index, kind) in CHANNEL_KINDS.iter().enumerate() {
+                kinds.set(index + 1, *kind)?;
+            }
+            Ok(kinds)
+        })?,
+    )?;
+    events.set(
+        "types",
+        lua.create_function(|lua, ()| {
+            let types = lua.create_table()?;
+            for (index, kind) in EVENT_TYPES.iter().enumerate() {
+                types.set(index + 1, *kind)?;
+            }
+            Ok(types)
         })?,
     )?;
     mtrak.set("events", events)?;

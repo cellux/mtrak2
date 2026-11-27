@@ -170,3 +170,28 @@ request's cancellation flag; `drain_requests` skips such requests so a client
 that already saw a timeout cannot mutate the project later. The application
 loop's own 30 s evaluation timeout keeps a single request well inside the
 worker's window.
+
+## D16. `/status` and `/help` extend the plan's four routes
+
+The plan listed `/eval`, `/play`, `/stop`, and `/repl/reset`. Two read-only
+routes were added because the original surface made state unobservable:
+`/eval` stops playback before evaluating (D6), so `mtrak.project.playing` could
+never report `true`. `/status` reads playback and project state without
+touching the transport, and `/help` lists the routes and namespaces. Neither
+mutates the project. Running a macro is still not possible; that would need a
+separate design for macro coroutines and is out of scope for this milestone.
+
+## D17. Read-only discovery helpers never raise
+
+`patterns.exists` and `macros.exists` return booleans instead of raising for
+missing IDs, so clients can branch without `pcall`. `settings.keys`,
+`events.kinds`, `events.types`, `repl.info`, and `help` expose the surface
+without reading source. `macros.validate` compiles a module source and discards
+the generated Lua, so it checks syntax and identifiers without storing or
+running anything.
+
+## D18. Batch writes are atomic
+
+`patterns.set-slots` applies every requested slot to a clone and commits only
+when all indices are valid. A single bad index leaves the pattern untouched,
+matching the atomicity rule already applied to `create` and `resize`.

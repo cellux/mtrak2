@@ -153,6 +153,120 @@ mod tests {
     }
 
     #[test]
+    fn discovery_helpers_list_the_surface() {
+        let mut app = test_app();
+        let mut session = ReplSession::new().unwrap();
+        let keys = eval_string(&mut session, &mut app, "(mtrak.settings.keys)");
+        for key in ["root", "scale", "modal-degree"] {
+            assert!(keys.contains(key), "{keys}");
+        }
+        let kinds = eval_string(&mut session, &mut app, "(mtrak.events.kinds)");
+        for kind in ["note-on", "control-change", "pitch-bend"] {
+            assert!(kinds.contains(kind), "{kinds}");
+        }
+        let types = eval_string(&mut session, &mut app, "(mtrak.events.types)");
+        for kind in ["empty", "channel", "sysex"] {
+            assert!(types.contains(kind), "{types}");
+        }
+        let help = eval_string(&mut session, &mut app, "(mtrak.help)");
+        assert!(help.contains("/status"), "{help}");
+        assert!(help.contains("patterns"), "{help}");
+    }
+
+    #[test]
+    fn repl_info_reports_limits() {
+        let mut app = test_app();
+        let mut session = ReplSession::new().unwrap();
+        let info = eval_string(&mut session, &mut app, "(mtrak.repl.info)");
+        assert!(info.contains("instruction-budget"), "{info}");
+        assert!(info.contains("timeout-seconds"), "{info}");
+        assert!(info.contains("max-request-bytes"), "{info}");
+        assert!(info.contains("fennel-version"), "{info}");
+    }
+
+    #[test]
+    fn existence_checks_do_not_raise() {
+        let mut app = test_app();
+        let mut session = ReplSession::new().unwrap();
+        let present = eval_string(&mut session, &mut app, "(mtrak.patterns.exists 0)");
+        assert!(present.contains("true"), "{present}");
+        let absent = eval_string(&mut session, &mut app, "(mtrak.patterns.exists 0x7F)");
+        assert!(absent.contains("false"), "{absent}");
+        let module = eval_string(&mut session, &mut app, "(mtrak.macros.exists 0x40)");
+        assert!(module.contains("false"), "{module}");
+    }
+
+    #[test]
+    fn seed_int_matches_the_hex_seed() {
+        let mut app = test_app();
+        let mut session = ReplSession::new().unwrap();
+        eval_string(&mut session, &mut app, "(mtrak.project.set-seed 0x10)");
+        let value = eval_string(&mut session, &mut app, "(mtrak.project.seed-int)");
+        assert!(value.trim() == "16", "{value}");
+    }
+
+    #[test]
+    fn patterns_events_and_set_slots_round_trip() {
+        let mut app = test_app();
+        let mut session = ReplSession::new().unwrap();
+        eval_string(
+            &mut session,
+            &mut app,
+            "(mtrak.patterns.create 0x10 {:lpb 4})",
+        );
+        let result = eval_string(
+            &mut session,
+            &mut app,
+            "(mtrak.patterns.set-slots 0x10 [{:row 1 :track 2 :event (mtrak.events.note-on 0 60 100)} {:row 3 :track 4 :event (mtrak.events.note-off 0 60 0) :offset 7}])",
+        );
+        assert!(!result.contains("error"), "{result}");
+        let events = eval_string(&mut session, &mut app, "(mtrak.patterns.events 0x10)");
+        assert!(events.contains("60"), "{events}");
+        assert!(events.contains("note-off"), "{events}");
+        let slot = eval_string(&mut session, &mut app, "(mtrak.patterns.get-slot 0x10 3 4)");
+        assert!(slot.contains("offset"), "{slot}");
+    }
+
+    #[test]
+    fn set_slots_is_atomic() {
+        let mut app = test_app();
+        let mut session = ReplSession::new().unwrap();
+        eval_string(
+            &mut session,
+            &mut app,
+            "(mtrak.patterns.create 0x10 {:lpb 4})",
+        );
+        let result = eval_string(
+            &mut session,
+            &mut app,
+            "(mtrak.patterns.set-slots 0x10 [{:row 0 :track 0 :event (mtrak.events.note-on 0 60 100)} {:row 99 :track 0 :event (mtrak.events.note-on 0 61 100)}])",
+        );
+        assert!(result.contains("outside"), "{result}");
+        let events = eval_string(&mut session, &mut app, "(mtrak.patterns.events 0x10)");
+        assert!(!events.contains("60"), "first entry leaked: {events}");
+    }
+
+    #[test]
+    fn macros_validate_compiles_without_storing() {
+        let mut app = test_app();
+        let mut session = ReplSession::new().unwrap();
+        let ok = eval_string(
+            &mut session,
+            &mut app,
+            "(mtrak.macros.validate 0x40 \"(local M {})\\n\\n(fn M.run [a b c]\\n  nil)\\n\\nM\\n\")",
+        );
+        assert!(ok.contains("true"), "{ok}");
+        let bad = eval_string(
+            &mut session,
+            &mut app,
+            "(mtrak.macros.validate 0x40 \"(broken\")",
+        );
+        assert!(bad.contains("error"), "{bad}");
+        let list = eval_string(&mut session, &mut app, "(mtrak.macros.list)");
+        assert!(!list.contains("64"), "validate stored a module: {list}");
+    }
+
+    #[test]
     fn cancelled_requests_are_skipped() {
         use std::sync::atomic::AtomicBool;
         use std::sync::mpsc;

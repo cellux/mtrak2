@@ -19,7 +19,7 @@ pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 /// Maximum size of the request line and headers.
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 /// How long an HTTP worker waits for the application thread.
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(35);
+pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(35);
 /// How long a worker waits for more request bytes before giving up.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a worker waits to write a response before giving up.
@@ -245,6 +245,8 @@ fn dispatch(request: &HttpRequest, requests: &Sender<ReplRequest>) -> ReplRespon
         },
         "/stop" => ReplRequestKind::Stop,
         "/repl/reset" => ReplRequestKind::Reset,
+        "/status" => ReplRequestKind::Status,
+        "/help" => ReplRequestKind::Help,
         _ => {
             return error_response(&ReplError::Protocol(format!(
                 "unknown route {}",

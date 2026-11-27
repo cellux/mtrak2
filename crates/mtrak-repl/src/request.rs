@@ -20,6 +20,10 @@ pub enum ReplRequestKind {
     Stop,
     /// Clear session-defined globals.
     Reset,
+    /// Report playback and project state without stopping playback.
+    Status,
+    /// Report the routes and namespaces the REPL exposes.
+    Help,
 }
 
 /// A request waiting for the application loop.

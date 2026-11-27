@@ -12,13 +12,13 @@ use crate::api;
 use crate::error::ReplError;
 
 /// Hard cap on the REPL Lua heap.
-const MEMORY_LIMIT: usize = 1024 * 1024 * 1024;
+pub const MEMORY_LIMIT: usize = 1024 * 1024 * 1024;
 /// Instructions between hook checks.
 const HOOK_INTERVAL: u32 = 1000;
 /// Total instructions allowed per evaluation.
-const INSTRUCTION_BUDGET: u64 = 50_000_000;
+pub const INSTRUCTION_BUDGET: u64 = 50_000_000;
 /// Wall-clock limit per evaluation.
-const TIMEOUT: Duration = Duration::from_secs(30);
+pub const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A persistent REPL session.
 pub struct ReplSession {
@@ -108,6 +108,11 @@ impl ReplSession {
             return Err(error);
         }
         result.map_err(map_lua_error)
+    }
+
+    /// The Lua handle backing this session.
+    pub fn lua(&self) -> &Lua {
+        &self.lua
     }
 
     /// Clears session-defined globals without touching the project.

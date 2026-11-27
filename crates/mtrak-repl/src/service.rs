@@ -37,6 +37,14 @@ pub fn handle_request(
             Ok(()) => success_response(&Value::Nil),
             Err(error) => error_response(&error),
         },
+        ReplRequestKind::Status => match status_table(session.lua(), app) {
+            Ok(value) => success_response(&Value::Table(value)),
+            Err(error) => error_response(&ReplError::Runtime(error.to_string())),
+        },
+        ReplRequestKind::Help => match crate::api::help_table(session.lua()) {
+            Ok(value) => success_response(&Value::Table(value)),
+            Err(error) => error_response(&ReplError::Runtime(error.to_string())),
+        },
     }
 }
 
@@ -53,6 +61,18 @@ pub fn drain_requests(session: &mut ReplSession, app: &mut App, receiver: &Recei
         let response = handle_request(session, app, request.kind);
         let _ = request.response.send(response);
     }
+}
+
+/// Reports playback and project state without disturbing playback.
+fn status_table(lua: &mlua::Lua, app: &App) -> mlua::Result<mlua::Table> {
+    let table = lua.create_table()?;
+    table.set("playing", app.is_playing())?;
+    table.set("row", app.play_row())?;
+    table.set("pattern", app.current_pattern().value())?;
+    table.set("mode", format!("{:?}", app.mode()).to_lowercase())?;
+    table.set("dirty", app.is_dirty())?;
+    table.set("revision", app.project_revision())?;
+    Ok(table)
 }
 
 /// Builds a successful JSON response.

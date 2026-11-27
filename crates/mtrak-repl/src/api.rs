@@ -22,6 +22,17 @@ pub(crate) const SAFE_GLOBALS: &[&str] = &[
 /// when called, because the REPL does not run as a macro coroutine.
 pub(crate) const REJECTED_GLOBALS: &[&str] = &["emit", "wait", "trigger", "stop-track"];
 
+/// The HTTP routes the listener accepts.
+pub const ROUTES: &[&str] = &["/eval", "/play", "/stop", "/repl/reset", "/status", "/help"];
+
+/// The `mtrak` namespaces installed for every evaluation.
+pub const NAMESPACES: &[&str] = &[
+    "patterns", "macros", "settings", "project", "events", "repl",
+];
+
+/// The settings keys accepted by `mtrak.settings`.
+pub const SETTING_KEYS: &[&str] = &["root", "scale", "modal-degree"];
+
 /// Installs the REPL API into `api`, whose `__index` is the persistent globals
 /// table.
 pub fn install_api<'scope, 'env>(
@@ -53,7 +64,7 @@ pub fn install_api<'scope, 'env>(
     install_macros(scope, lua, &mtrak, app, compiler)?;
     install_settings(scope, lua, &mtrak, app)?;
     install_project(scope, lua, &mtrak, app)?;
-    install_repl(scope, lua, &mtrak, globals)?;
+    install_repl(scope, lua, &mtrak, globals, compiler)?;
     crate::events::install_events(lua, &mtrak)?;
     api.set("mtrak", mtrak)?;
     Ok(())
@@ -294,6 +305,89 @@ fn install_patterns<'scope, 'env>(
         )?,
     )?;
 
+    patterns.set(
+        "exists",
+        scope.create_function(|_, id: Value| {
+            let id = value_to_byte(id, "pattern id")?;
+            let app = app.borrow();
+            Ok(app.project().composition.pattern(PatternId(id)).is_some())
+        })?,
+    )?;
+
+    patterns.set(
+        "events",
+        scope.create_function(|lua, id: Value| {
+            let id = value_to_byte(id, "pattern id")?;
+            let app = app.borrow();
+            let pattern = app
+                .project()
+                .composition
+                .pattern(PatternId(id))
+                .ok_or_else(|| {
+                    mlua::Error::RuntimeError(format!("pattern {id:02X} does not exist"))
+                })?;
+            let events = lua.create_table()?;
+            let mut index = 0;
+            for (row, track, slot) in pattern.iter_slots() {
+                if slot.is_empty() {
+                    continue;
+                }
+                index += 1;
+                let entry = lua.create_table()?;
+                entry.set("row", row)?;
+                entry.set("track", track)?;
+                entry.set("offset", slot.offset)?;
+                entry.set("event", crate::events::event_to_lua(lua, &slot.event)?)?;
+                events.set(index, entry)?;
+            }
+            Ok(events)
+        })?,
+    )?;
+
+    patterns.set(
+        "set-slots",
+        scope.create_function(|_, (id, entries): (Value, Table)| {
+            let id = value_to_byte(id, "pattern id")?;
+            let mut updates = Vec::new();
+            for entry in entries.sequence_values::<Table>() {
+                let entry = entry?;
+                let row = table_usize(&entry, "row")?.ok_or_else(|| {
+                    mlua::Error::RuntimeError("each entry needs a row".to_string())
+                })?;
+                let track = table_usize(&entry, "track")?.ok_or_else(|| {
+                    mlua::Error::RuntimeError("each entry needs a track".to_string())
+                })?;
+                let offset = table_u32(&entry, "offset")?.unwrap_or(0);
+                let event = event_from_lua(entry.get("event")?)?;
+                updates.push((row, track, event, offset));
+            }
+            let mut app = app.borrow_mut();
+            {
+                let pattern = app
+                    .repl_project_mut()
+                    .composition
+                    .pattern_mut(PatternId(id))
+                    .ok_or_else(|| {
+                        mlua::Error::RuntimeError(format!("pattern {id:02X} does not exist"))
+                    })?;
+                // Apply every entry to a clone so a bad index changes nothing.
+                let mut candidate = pattern.clone();
+                for (row, track, event, offset) in updates {
+                    let slot = candidate.slot_mut(row, track).ok_or_else(|| {
+                        mlua::Error::RuntimeError(format!(
+                            "slot {row}:{track} is outside pattern {id:02X}"
+                        ))
+                    })?;
+                    slot.event = event;
+                    slot.offset = offset;
+                }
+                *pattern = candidate;
+            }
+            app.repl_after_pattern_change();
+            Ok(())
+        })?,
+    )?;
+
     mtrak.set("patterns", patterns)?;
     Ok(())
 }
@@ -527,6 +621,32 @@ fn install_macros<'scope, 'env>(
         })?,
     )?;
 
+    macros.set(
+        "exists",
+        scope.create_function(|_, id: Value| {
+            let id = value_to_byte(id, "module id")?;
+            let app = app.borrow();
+            Ok(app.project().modules.contains_key(&id))
+        })?,
+    )?;
+
+    macros.set(
+        "validate",
+        scope.create_function(|_, (id, source): (Value, String)| {
+            let id = value_to_byte(id, "module id")?;
+            // Setup and user modules are writable; built-ins are not.
+            if id != 0 && (0x01..0x40).contains(&id) {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "module {id:02X} is a built-in and cannot be modified"
+                )));
+            }
+            compiler
+                .compile(&source, id, id == 0)
+                .map_err(|error| mlua::Error::RuntimeError(error.message))?;
+            Ok(true)
+        })?,
+    )?;
+
     mtrak.set("macros", macros)?;
     Ok(())
 }
@@ -570,6 +690,17 @@ fn install_settings<'scope, 'env>(
             }
             app.repl_mark_mutated();
             Ok(())
+        })?,
+    )?;
+
+    settings.set(
+        "keys",
+        scope.create_function(|lua, ()| {
+            let keys = lua.create_table()?;
+            for (index, key) in SETTING_KEYS.iter().enumerate() {
+                keys.set(index + 1, *key)?;
+            }
+            Ok(keys)
         })?,
     )?;
 
@@ -718,6 +849,14 @@ fn install_project<'scope, 'env>(
         })?,
     )?;
 
+    project.set(
+        "seed-int",
+        scope.create_function(|_, ()| {
+            let app = app.borrow();
+            Ok(app.project().composition.seed() as i64)
+        })?,
+    )?;
+
     mtrak.set("project", project)?;
     Ok(())
 }
@@ -727,6 +866,7 @@ fn install_repl<'scope, 'env>(
     lua: &'env Lua,
     mtrak: &Table,
     globals: &'scope Table,
+    compiler: &'env FennelCompiler,
 ) -> mlua::Result<()> {
     let repl = lua.create_table()?;
     repl.set(
@@ -736,8 +876,44 @@ fn install_repl<'scope, 'env>(
             Ok(())
         })?,
     )?;
+    repl.set(
+        "info",
+        scope.create_function(|lua, ()| {
+            let info = lua.create_table()?;
+            info.set("timeout-seconds", crate::session::TIMEOUT.as_secs())?;
+            info.set("instruction-budget", crate::session::INSTRUCTION_BUDGET)?;
+            info.set("memory-bytes", crate::session::MEMORY_LIMIT)?;
+            info.set("max-request-bytes", crate::http::MAX_REQUEST_BYTES)?;
+            info.set("max-response-bytes", crate::http::MAX_RESPONSE_BYTES)?;
+            info.set(
+                "response-timeout-seconds",
+                crate::http::RESPONSE_TIMEOUT.as_secs(),
+            )?;
+            info.set("max-json-depth", crate::json::MAX_JSON_DEPTH)?;
+            info.set("max-json-nodes", crate::json::MAX_JSON_NODES)?;
+            info.set("fennel-version", compiler.version().unwrap_or_default())?;
+            Ok(info)
+        })?,
+    )?;
     mtrak.set("repl", repl)?;
+    mtrak.set("help", scope.create_function(|lua, ()| help_table(lua))?)?;
     Ok(())
+}
+
+/// Builds the discovery table returned by `mtrak.help` and `POST /help`.
+pub fn help_table(lua: &Lua) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    let routes = lua.create_table()?;
+    for (index, route) in ROUTES.iter().enumerate() {
+        routes.set(index + 1, *route)?;
+    }
+    table.set("routes", routes)?;
+    let namespaces = lua.create_table()?;
+    for (index, namespace) in NAMESPACES.iter().enumerate() {
+        namespaces.set(index + 1, *namespace)?;
+    }
+    table.set("namespaces", namespaces)?;
+    Ok(table)
 }
 
 fn settings_value(

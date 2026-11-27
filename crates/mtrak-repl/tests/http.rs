@@ -212,6 +212,39 @@ fn eval_rejects_empty_form() {
 }
 
 #[test]
+fn help_lists_routes_and_namespaces() {
+    let service = TestService::start();
+    let (status, body) = http_request(service.port, "POST", "/help", "");
+    assert_eq!(status, 200, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["ok"], true);
+    let printed = json["printed"].as_str().unwrap();
+    assert!(printed.contains("/status"), "{printed}");
+    assert!(printed.contains("patterns"), "{printed}");
+}
+
+#[test]
+fn status_reports_playback_without_stopping_it() {
+    let service = TestService::start();
+    let (status, body) = http_request(service.port, "POST", "/play", "");
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = http_request(service.port, "POST", "/status", "");
+    assert_eq!(status, 200, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["value"]["playing"], true, "{body}");
+    // A second status call still reports playback: reading must not stop it.
+    let (_, body) = http_request(service.port, "POST", "/status", "");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["value"]["playing"], true, "{body}");
+    let (_, body) = http_request(service.port, "POST", "/stop", "");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["ok"], true, "{body}");
+    let (_, body) = http_request(service.port, "POST", "/status", "");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["value"]["playing"], false, "{body}");
+}
+
+#[test]
 fn eval_returns_json_success() {
     let service = TestService::start();
     let (status, body) = http_request(

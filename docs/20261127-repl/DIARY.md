@@ -307,6 +307,28 @@ Sweep complete. The REPL surface has been exercised end to end: every pattern,
 macro, settings, project, event, and repl operation; the sandbox allowlist; the
 HTTP protocol layer; JSON limits; and session persistence.
 
+### API surface added after the sweep
+
+The sweep showed gaps that made the REPL hard to use as an agent interface.
+These were added afterwards; running macros (item 5 of the review) was
+deliberately **not** added, because it needs a deeper design change to the
+sandbox.
+
+- `POST /status` — reports `playing`, `row`, `pattern`, `mode`, `dirty`, and
+  `revision` without evaluating a form. Before this, `mtrak.project.playing`
+  could never be observed as `true`, because `/eval` stops playback first.
+- `POST /help` and `mtrak.help` — list the routes and namespaces.
+- `mtrak.settings.keys` — the valid settings keys.
+- `mtrak.events.kinds` / `mtrak.events.types` — the `:kind` and `:type` strings.
+- `mtrak.patterns.exists` / `mtrak.macros.exists` — boolean checks that never
+  raise.
+- `mtrak.patterns.events` — every non-empty slot as `{row, track, offset, event}`.
+- `mtrak.patterns.set-slots` — batch slot writes applied to a clone, so a bad
+  index changes nothing.
+- `mtrak.project.seed-int` — the seed as a Lua integer alongside the hex string.
+- `mtrak.repl.info` — the configured limits and the embedded Fennel version.
+- `mtrak.macros.validate` — compile-only check; nothing is stored or executed.
+
 ### Remaining work
 
 The following plan acceptance-criteria tests are still not covered:
